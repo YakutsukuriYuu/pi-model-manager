@@ -30,7 +30,7 @@ import {
   removeProvider,
   upsertModel,
 } from "../models-json.ts";
-import { type Column, type ThemeLike, compactCount, frame, safeTheme, table } from "./frame.ts";
+import { SELECTED_MARKER, UNSELECTED_MARKER, type Column, type ThemeLike, compactCount, frame, safeTheme, table } from "./frame.ts";
 
 /** Re-exported so the extension entry point can build the catalog index. */
 export type { CatalogModel };
@@ -141,10 +141,10 @@ type Screen =
   | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; target: ModelTarget; draft: ModelDraft; field: number }
   | { kind: "fetch"; providerId: string; rows: FetchRow[]; checked: Set<string>; index: number };
 
-const PROVIDER_ACTIONS = "↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
-const MODEL_ACTIONS = "↑↓ 选择   Enter 使用   e 编辑模型   a 添加模型   f 获取模型   p 编辑接入   d 删除   Esc 返回";
+const PROVIDER_ACTIONS = "↑↓/PgUp/PgDn/Home/End 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
+const MODEL_ACTIONS = "↑↓/PgUp/PgDn/Home/End 选择   Enter 使用   e 编辑模型   a 添加模型   f 获取模型   p 编辑接入   d 删除   Esc 返回";
 const FORM_ACTIONS = "↑↓ 选择字段   Enter 编辑   ←→ 切换   Ctrl+S 保存   Esc 取消";
-const FETCH_ACTIONS = "↑↓ 移动   Space 勾选   u 勾选值不同的   a 全选/全不选   Enter 保存   Esc 取消";
+const FETCH_ACTIONS = "↑↓/PgUp/PgDn/Home/End 移动   Space 勾选   u 勾选值不同的   a 全选/全不选   Enter 保存   Esc 取消";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -452,6 +452,19 @@ export class ModelManager implements Component, Focusable {
     return this.host.providerDefaults(providerId);
   }
 
+  /**
+   * Rows a list may occupy.
+   *
+   * This component replaces the editor rather than owning the screen, so the
+   * transcript keeps the space above it. Half the terminal keeps the frame
+   * inside the layout at every size, and the cap stops a very tall terminal
+   * from turning the list into something the eye cannot scan.
+   */
+  private maxListRows(): number {
+    const rows = this.tui.terminal?.rows ?? 40;
+    return Math.max(4, Math.min(18, Math.floor(rows / 2) - 3));
+  }
+
   private async commit(doc: ModelsDocument, success: string): Promise<boolean> {
     this.busy = true;
     this.refresh("保存中…");
@@ -631,6 +644,24 @@ export class ModelManager implements Component, Focusable {
     return (index + delta + count) % count;
   }
 
+  /**
+   * Shared list navigation.
+   *
+   * Returns the new index, or undefined when the key is not a navigation key.
+   * Up/down wrap, while paging and Home/End stop at the ends, which is what
+   * those keys are expected to do.
+   */
+  private navigate(data: string, index: number, count: number, page: number): number | undefined {
+    if (matchesKey(data, Key.up)) return this.move(index, -1, count);
+    if (matchesKey(data, Key.down)) return this.move(index, 1, count);
+    if (count === 0) return undefined;
+    if (matchesKey(data, Key.pageUp)) return Math.max(0, index - page);
+    if (matchesKey(data, Key.pageDown)) return Math.min(count - 1, index + page);
+    if (matchesKey(data, Key.home)) return 0;
+    if (matchesKey(data, Key.end)) return count - 1;
+    return undefined;
+  }
+
   private handleProviders(data: string): void {
     const screen = this.screen as Extract<Screen, { kind: "providers" }>;
     const rows = this.providerRows();
@@ -638,13 +669,9 @@ export class ModelManager implements Component, Focusable {
       this.host.close();
       return;
     }
-    if (matchesKey(data, Key.up)) {
-      this.screen = { ...screen, index: this.move(screen.index, -1, rows.length) };
-      this.refresh();
-      return;
-    }
-    if (matchesKey(data, Key.down)) {
-      this.screen = { ...screen, index: this.move(screen.index, 1, rows.length) };
+    const next = this.navigate(data, screen.index, rows.length, this.maxListRows());
+    if (next !== undefined) {
+      this.screen = { ...screen, index: next };
       this.refresh();
       return;
     }
@@ -685,13 +712,9 @@ export class ModelManager implements Component, Focusable {
       this.refresh();
       return;
     }
-    if (matchesKey(data, Key.up)) {
-      this.screen = { ...screen, index: this.move(screen.index, -1, rows.length) };
-      this.refresh();
-      return;
-    }
-    if (matchesKey(data, Key.down)) {
-      this.screen = { ...screen, index: this.move(screen.index, 1, rows.length) };
+    const next = this.navigate(data, screen.index, rows.length, this.maxListRows());
+    if (next !== undefined) {
+      this.screen = { ...screen, index: next };
       this.refresh();
       return;
     }
@@ -856,9 +879,9 @@ export class ModelManager implements Component, Focusable {
       this.refresh();
       return;
     }
-    if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
-      const delta = matchesKey(data, Key.up) ? -1 : 1;
-      this.screen = { ...screen, index: this.move(screen.index, delta, screen.rows.length) };
+    const next = this.navigate(data, screen.index, screen.rows.length, this.maxListRows());
+    if (next !== undefined) {
+      this.screen = { ...screen, index: next };
       this.refresh();
       return;
     }
@@ -1018,9 +1041,21 @@ export class ModelManager implements Component, Focusable {
     return { text: actions, tone: "dim" };
   }
 
+  /**
+   * Marker for the focused row.
+   *
+   * The row is also background-highlighted, but a colour alone is invisible on
+   * themes with a subtle `selectedBg` and in terminals without colour support.
+   */
+  private markerFor<T>(rows: readonly T[], selected: number): (row: T) => string {
+    const focused = rows[selected];
+    return (row) => (row === focused ? SELECTED_MARKER : UNSELECTED_MARKER);
+  }
+
   private renderProviders(width: number): string[] {
     const rows = this.providerRows();
     const screen = this.screen as Extract<Screen, { kind: "providers" }>;
+    const selected = Math.min(screen.index, Math.max(0, rows.length - 1));
     const configured = rows.filter((row) => row.inConfig).length;
     const columns: Column<ProviderRow>[] = [
       { title: "接入", width: "flex", value: (row) => row.id },
@@ -1033,7 +1068,16 @@ export class ModelManager implements Component, Focusable {
       width,
       title: `Pi 模型配置 · ${configured} 个接入配置 · ${rows.reduce((total, row) => total + row.modelCount, 0)} 个模型`,
       meta: [modelsJsonPath()],
-      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "没有任何接入。按 n 新建，填 Base URL 和 API Key 即可自动获取模型。" }),
+      body: table({
+        theme: this.theme,
+        width,
+        columns,
+        rows,
+        selected,
+        marker: this.markerFor(rows, selected),
+        empty: "没有任何接入。按 n 新建，填 Base URL 和 API Key 即可自动获取模型。",
+        maxRows: this.maxListRows(),
+      }),
       footer: this.footer(PROVIDER_ACTIONS).text,
       footerTone: this.footer(PROVIDER_ACTIONS).tone,
     });
@@ -1043,6 +1087,7 @@ export class ModelManager implements Component, Focusable {
     const screen = this.screen as Extract<Screen, { kind: "models" }>;
     const entry = this.providerEntry(providerId);
     const rows = this.modelRows(providerId);
+    const selected = Math.min(screen.index, Math.max(0, rows.length - 1));
     const defaults = this.providerDefaults(providerId);
     const baseUrl = (typeof entry?.baseUrl === "string" && entry.baseUrl) || defaults.baseUrl;
     const apiKey = typeof entry?.apiKey === "string" ? redactSecret(entry.apiKey) : "(未设置)";
@@ -1059,7 +1104,16 @@ export class ModelManager implements Component, Focusable {
       width,
       title: `接入 ${providerId}${entry ? "" : "（内置，尚无配置）"}`,
       meta: [`${baseUrl ?? "(未设置 Base URL)"} · API Key ${apiKey}`, `模型 ${rows.length} 个（配置 ${rows.filter((row) => row.inConfig).length} 个，内置 ${rows.filter((row) => !row.inConfig).length} 个）`],
-      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "该接入还没有模型。按 f 从上游获取，或按 a 手动添加。" }),
+      body: table({
+        theme: this.theme,
+        width,
+        columns,
+        rows,
+        selected,
+        marker: this.markerFor(rows, selected),
+        empty: "该接入还没有模型。按 f 从上游获取，或按 a 手动添加。",
+        maxRows: this.maxListRows(),
+      }),
       footer: footer.text,
       footerTone: footer.tone,
     });
@@ -1101,7 +1155,7 @@ export class ModelManager implements Component, Focusable {
       width,
       title: `${isNew ? "新建" : "编辑"}${what}`,
       meta: this.editing ? [] : (meta ?? ["留空并保存即删除该项；表单未列出的字段会原样保留"]),
-      body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "" }),
+      body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "", maxRows: this.maxListRows(), marker: this.markerFor(fields, selected) }),
       footer: footer.text,
       footerTone: footer.tone,
     });
@@ -1110,6 +1164,7 @@ export class ModelManager implements Component, Focusable {
   private renderFetch(width: number): string[] {
     const screen = this.screen as Extract<Screen, { kind: "fetch" }>;
     const rows = screen.rows;
+    const selected = Math.min(screen.index, Math.max(0, rows.length - 1));
     const columns: Column<FetchRow>[] = [
       { title: "", width: 3, value: (row) => (screen.checked.has(row.model.id) ? "[x]" : "[ ]") },
       { title: "模型", width: "flex", value: (row) => row.model.id },
@@ -1132,8 +1187,10 @@ export class ModelManager implements Component, Focusable {
         width,
         columns,
         rows,
-        selected: Math.min(screen.index, Math.max(0, rows.length - 1)),
+        selected,
+        marker: this.markerFor(rows, selected),
         empty: "上游没有返回任何模型",
+        maxRows: this.maxListRows(),
       }),
       footer: footer.text,
       footerTone: footer.tone,

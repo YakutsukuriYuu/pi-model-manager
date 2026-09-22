@@ -50,11 +50,40 @@ export interface TableOptions<T> {
   empty: string;
   /** Prefix for a row, e.g. a marker. Rendered before the first column. */
   marker?(row: T): string;
+  /**
+   * Cap on rendered rows. The window follows the selection: a list taller than
+   * the space available pushes the highlighted row off screen, leaving no way
+   * to see where the cursor is.
+   */
+  maxRows?: number;
 }
 
 const GAP = 2;
 const MARKER_WIDTH = 2;
 const FLEX_MIN = 8;
+
+/**
+ * Gutter marker for the focused row.
+ *
+ * The selection is also highlighted with a background colour, but a colour
+ * alone is invisible on themes with a subtle `selectedBg` and in terminals
+ * without colour, so the cursor needs a glyph of its own.
+ */
+export const SELECTED_MARKER = "›";
+export const UNSELECTED_MARKER = " ";
+
+/**
+ * Visible slice that keeps the selected row on screen.
+ *
+ * Same rule Pi's own model selector uses: centre the selection, then clamp so
+ * the window never runs past either end.
+ */
+export function windowRange(total: number, selected: number, maxRows: number): { start: number; end: number } {
+  const limit = Math.max(1, Math.floor(maxRows));
+  if (total <= limit) return { start: 0, end: total };
+  const start = Math.max(0, Math.min(selected - Math.floor(limit / 2), total - limit));
+  return { start, end: Math.min(start + limit, total) };
+}
 
 function resolveWidths<T>(columns: Array<Column<T>>, width: number): number[] {
   const gaps = GAP * Math.max(0, columns.length - 1);
@@ -84,11 +113,19 @@ export function table<T>(options: TableOptions<T>): string[] {
     return lines;
   }
 
-  rows.forEach((row, index) => {
+  const range = windowRange(rows.length, selected, options.maxRows ?? rows.length);
+  if (range.start > 0 || range.end < rows.length) {
+    // Without this a capped list just looks truncated, and there is no way to
+    // tell that more rows exist below.
+    lines.push(truncateToWidth(theme.fg("dim", `  第 ${range.start + 1}-${range.end} 项 / 共 ${rows.length} 项`), width, ""));
+  }
+
+  for (let index = range.start; index < range.end; index++) {
+    const row = rows[index];
+    if (row === undefined) continue;
     const cells = columns.map((column, columnIndex) => {
       const raw = column.value(row);
-      const cell = column.right ? padLeft(truncateToWidth(raw, widths[columnIndex], ""), widths[columnIndex]) : pad(raw, widths[columnIndex]);
-      return cell;
+      return column.right ? padLeft(truncateToWidth(raw, widths[columnIndex], ""), widths[columnIndex]) : pad(raw, widths[columnIndex]);
     });
     const marker = options.marker?.(row) ?? " ";
     const content = `${marker} ${cells.join(" ".repeat(GAP))}`;
@@ -97,7 +134,7 @@ export function table<T>(options: TableOptions<T>): string[] {
     } else {
       lines.push(truncateToWidth(content, width, ""));
     }
-  });
+  }
 
   return lines;
 }

@@ -16,6 +16,10 @@ const KEY = {
   space: " ",
   backspace: "\x7f",
   save: "\x13",
+  pageUp: "\x1b[5~",
+  pageDown: "\x1b[6~",
+  home: "\x1b[H",
+  end: "\x1b[F",
 };
 
 function fakeTheme() {
@@ -39,6 +43,8 @@ function harness(
     discovered?: DiscoveredModel[];
     saveOk?: boolean;
     saveError?: string;
+    /** Terminal height the component budgets its list against. */
+    terminalRows?: number;
   } = {},
 ): Harness {
   let doc = structuredClone(initial);
@@ -64,7 +70,13 @@ function harness(
       isClosed = true;
     },
   };
-  const manager = new ModelManager({ requestRender: () => {} } as never, fakeTheme(), host.load(), host);
+  const manager = new ModelManager(
+    // SAFETY: the component only calls requestRender() and reads terminal.rows.
+    { requestRender: () => {}, terminal: { rows: options.terminalRows ?? 40 } } as never,
+    fakeTheme(),
+    host.load(),
+    host,
+  );
   return { manager, saved, doc: () => doc, closed: () => isClosed };
 }
 
@@ -403,6 +415,78 @@ test("a built-in model with no override cannot be deleted", async () => {
 
   assert.equal(h.saved.length, 0, "there is nothing to delete yet");
   assert.match(h.manager.render(140).join("\n"), /没有可删除的配置/);
+});
+
+test("a long model list scrolls with the cursor instead of running off screen", () => {
+  const models = Array.from({ length: 69 }, (_, index) => ({ id: `model-${String(index).padStart(2, "0")}` }));
+  const h = harness({ providers: { demo: { baseUrl: "https://api.example.com/v1", api: "openai-completions", models } } });
+
+  h.manager.handleInput(KEY.enter);
+  const visibleRows = (h.manager.render(120).length);
+  assert.ok(visibleRows < 30, `frame should stay small, got ${visibleRows} lines`);
+
+  // Walk to the very bottom of the list.
+  for (let i = 0; i < 68; i++) h.manager.handleInput(KEY.down);
+  const lines = h.manager.render(120);
+  const shown = lines.join("\n");
+
+  assert.ok(shown.includes("model-68"), "the selected row must be rendered");
+  assert.ok(shown.includes("共 69 项"), "the scroll position must be reported");
+  assert.equal(lines.length, visibleRows, "the frame height must not grow with the list");
+  assert.ok(!shown.includes("model-00"), "rows scrolled past should not be rendered");
+
+  // And back to the top.
+  for (let i = 0; i < 68; i++) h.manager.handleInput(KEY.up);
+  const top = h.manager.render(120).join("\n");
+  assert.ok(top.includes("model-00"));
+  assert.ok(!top.includes("model-68"));
+});
+
+test("the list gets shorter on a shorter terminal", () => {
+  const models = Array.from({ length: 40 }, (_, index) => ({ id: `m-${index}` }));
+  const doc: ModelsDocument = { providers: { demo: { baseUrl: "https://a/v1", api: "openai-completions", models } } };
+
+  const tall = harness(doc, { terminalRows: 60 });
+  tall.manager.handleInput(KEY.enter);
+  const tallLines = tall.manager.render(120).length;
+
+  const short = harness(doc, { terminalRows: 20 });
+  short.manager.handleInput(KEY.enter);
+  const shortLines = short.manager.render(120).length;
+
+  assert.ok(shortLines < tallLines, `expected ${shortLines} < ${tallLines}`);
+
+  // Selection stays visible even in the smallest case.
+  for (let i = 0; i < 39; i++) short.manager.handleInput(KEY.down);
+  assert.ok(short.manager.render(120).join("\n").includes("m-39"));
+});
+
+test("paging and Home/End move around a long list", () => {
+  const models = Array.from({ length: 69 }, (_, index) => ({ id: `model-${String(index).padStart(2, "0")}` }));
+  const h = harness({ providers: { demo: { baseUrl: "https://a/v1", api: "openai-completions", models } } }, { terminalRows: 40 });
+  h.manager.handleInput(KEY.enter);
+  const shown = () => h.manager.render(120).join("\n");
+
+  h.manager.handleInput(KEY.end);
+  assert.ok(shown().includes("› model-68"), "End jumps to the last row");
+
+  h.manager.handleInput(KEY.home);
+  assert.ok(shown().includes("› model-00"), "Home jumps to the first row");
+
+  // One page equals the visible window, so the cursor lands near the bottom.
+  h.manager.handleInput(KEY.pageDown);
+  assert.ok(!shown().includes("› model-00"), "PgDn moves at least a screenful");
+  assert.ok(shown().includes("› model-17"), `PgDn should move one page, got: ${shown().split("\n")[5]}`);
+
+  h.manager.handleInput(KEY.pageUp);
+  assert.ok(shown().includes("› model-00"), "PgUp comes back");
+
+  // Paging must not wrap past the ends.
+  h.manager.handleInput(KEY.pageUp);
+  assert.ok(shown().includes("› model-00"));
+  h.manager.handleInput(KEY.end);
+  h.manager.handleInput(KEY.pageDown);
+  assert.ok(shown().includes("› model-68"), "PgDn stops at the last row");
 });
 
 test("escape closes the manager from the provider list", () => {
