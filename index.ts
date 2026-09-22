@@ -2,7 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { collectCatalog, type CatalogSnapshot } from "./src/catalog.ts";
 import {
-  createManagedProvider,
+  buildManagedProvider,
   loadManagedProviders,
   managedProviderIds,
   saveManagedProviders,
@@ -71,14 +71,14 @@ async function addManagedProvider(
   saveManagedProviders(next);
   configs.splice(0, configs.length, ...next);
   managedIds.add(id);
-  pi.registerProvider(createManagedProvider(config));
+  pi.registerProvider(config.id, buildManagedProvider(config));
   ctx.ui.notify(`已添加 ${name}。请执行 /login ${id} 保存 API key，然后回到 /models 刷新。`, "info");
 }
 
 export default function modelManagerExtension(pi: ExtensionAPI) {
   const managedConfigs = loadManagedProviders();
   const managedIds = managedProviderIds(managedConfigs);
-  for (const config of managedConfigs) pi.registerProvider(createManagedProvider(config));
+  for (const config of managedConfigs) pi.registerProvider(config.id, buildManagedProvider(config));
 
   pi.registerCommand(COMMAND, {
     description: "打开统一模型管理器（/models add 添加 Provider）",

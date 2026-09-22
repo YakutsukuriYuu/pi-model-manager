@@ -48,7 +48,38 @@ API Key 使用 Pi 原生认证存储；普通配置只保存 endpoint、API 类�
 
 ## 刷新策略
 
-刷新成功后更新运行时目录；刷新失败时保留旧模型并提示 Provider 错误。刷新动作通过 Pi 的 `ModelRegistry.refresh()` 触发，不主动发送模型请求。
+模型目录走 Pi 的动态 Provider 协议，分两种时机：
+
+```text
+启动（缓存优先，allowNetwork=false）
+  → 从 Pi 持久化的目录恢复模型，不发网络请求
+
+按需刷新（/models 按 R，allowNetwork=true）
+  → 请求上游 /models，成功则发布并持久化
+```
+
+规则：
+
+- 刷新失败只上报错误，不清空已有模型。
+- 未登录时静默跳过，不报错。
+- `--offline` 下不发任何请求。
+- 发现成功后通过 `context.publish({ persist })` 持久化，避免每次启动都依赖网络。
+
+## 扩展加载约束
+
+只使用 Pi 为扩展提供的裸模块别名：
+
+```text
+@earendil-works/pi-coding-agent
+@earendil-works/pi-ai
+@earendil-works/pi-tui
+```
+
+不要 import `@earendil-works/pi-ai/api/*` 这类子路径，也不要用 `createProvider()`。
+安装后的插件目录没有 `node_modules`，Pi 只别名固定几个裸导入，
+子路径会导致 `Cannot find module` 而让整个扩展加载失败。
+注册 Provider 统一使用配置形式：`pi.registerProvider(id, config)`，
+由 Pi 自己解析 `api` 对应的流式实现。
 
 ## 分阶段实现
 
