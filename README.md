@@ -28,16 +28,34 @@ pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 ↑↓/PgUp/PgDn/Home/End 选择   Enter 进入   n 新建   b 内置   r 重载   d 删除   Esc 关闭
 ```
 
-列表默认**只显示你在 `models.json` 里配置过的接入**。没有配置的 Pi 内置接入不显示 —— 它们里面没有你的东西。
+列表显示**属于你的接入**:
 
-需要给**内置模型**写覆盖时按 `b`，会列出 Pi 自带的接入，模型数来自 Pi 的目录：
+- 在 `models.json` 里配置过的
+- 用 `/login` 登录过、或通过环境变量/`--api-key` 提供凭据的
+
+两者取并集。既没配置又没凭据的 Pi 内置接入不显示 —— 它们里没有你的东西。
 
 ```text
-  接入              协议                来源    模型
-› commandcode       openai-completions  配置      15
-  anthropic         内置                内置      12
-  openai            内置                内置       9
+ Pi 模型配置 · 已配置 1 · 已登录 4 · 模型 29
+  接入                    协议                  认证       来源    模型
+› commandcode            openai-completions   环境变量   配置      15
+  deepseek               内置                  已登录     内置       2
+  kimi-coding            内置                  已登录     内置       4
 ```
+
+「认证」列告诉你凭据从哪来：
+
+| 显示 | 含义 |
+| --- | --- |
+| 已登录 | `auth.json`（`/login` 保存的 API key 或订阅令牌） |
+| 环境变量 | `models.json` 里写的 `$ENV_VAR` 引用 |
+| 配置 | `models.json` 里的字面值或 `!command` |
+| 本次运行 | `--api-key` 传入 |
+| 未登录 | 没有任何可用凭据 |
+
+用 `/login` 登录的接入**不需要写进 `models.json`**：Pi 已经给它配好了模型。你可以进入它看看，还能按 `f` 用你登录的凭据去上游把**更多**模型拉下来（实测：登录的 deepseek 能解析出凭据、endpoint、协议，`f` 会去请求 `https://api.deepseek.com/models`）。
+
+需要看 Pi 自带但你没用过的接入时按 `b`。
 
 ### 新建接入
 

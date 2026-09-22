@@ -45,6 +45,8 @@ function harness(
     saveError?: string;
     /** Terminal height the component budgets its list against. */
     terminalRows?: number;
+    /** Credential source per provider id, as Pi would report it. */
+    auth?: Record<string, string>;
   } = {},
 ): Harness {
   let doc = structuredClone(initial);
@@ -61,6 +63,10 @@ function harness(
     catalogProviderIds: () => Object.keys(options.catalog ?? {}),
     catalogModels: (providerId) => options.catalog?.[providerId] ?? [],
     catalogMetadata: () => options.metadata ?? new Map(),
+    authStatus: (providerId) => {
+      const source = options.auth?.[providerId];
+      return source === undefined ? { configured: false } : { configured: true, source };
+    },
     providerDefaults: (providerId) => ({ api: options.catalog?.[providerId] ? "openai-completions" : undefined }),
     fetchModels: async () => options.discovered ?? [],
     currentModelId: () => undefined,
@@ -546,6 +552,25 @@ test("deleting a provider asks for confirmation and names the model count", asyn
   h.manager.handleInput("y");
   await tick();
   assert.deepEqual(h.saved.at(-1)?.providers, {});
+});
+
+test("providers logged in with /login are listed without any config", () => {
+  const h = harness(PROVIDER_DOC, {
+    catalog: { deepseek: [{ id: "deepseek-chat" }], anthropic: [{ id: "claude" }] },
+    // deepseek came from /login; anthropic has neither config nor credential.
+    auth: { deepseek: "stored", demo: "environment" },
+  });
+
+  const shown = h.manager.render(120).join("\n");
+  assert.ok(shown.includes("demo"), "configured providers are listed");
+  assert.ok(shown.includes("deepseek"), "a /login credential is enough to be listed");
+  assert.ok(!shown.includes("anthropic"), "a provider with neither stays hidden");
+  assert.match(shown, /deepseek\s+内置\s+已登录/su, "the credential source is shown");
+  assert.match(shown, /demo\s+openai-completions\s+环境变量/su);
+
+  // Pi's own catalog is still one keypress away.
+  h.manager.handleInput("b");
+  assert.ok(h.manager.render(120).join("\n").includes("anthropic"));
 });
 
 test("escape closes the manager from the provider list", () => {

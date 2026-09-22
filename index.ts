@@ -97,6 +97,20 @@ function createHost(pi: ExtensionAPI, ctx: ExtensionContext, close: () => void):
       return { name: provider?.name, baseUrl: provider?.baseUrl, api };
     },
 
+    /**
+     * Pi owns credential resolution, so ask it rather than reading auth.json:
+     * this reports `/login`, `--api-key`, environment variables, and models.json
+     * keys uniformly, and never handles the secret itself.
+     */
+    authStatus(providerId: string) {
+      try {
+        const status = registry.getProviderAuthStatus(providerId);
+        return { configured: status.configured, source: status.source };
+      } catch {
+        return { configured: false };
+      }
+    },
+
     async fetchModels(providerId: string, baseUrl: string, api: ProviderApi): Promise<DiscoveredModel[]> {
       let resolved;
       try {
@@ -113,7 +127,10 @@ function createHost(pi: ExtensionAPI, ctx: ExtensionContext, close: () => void):
       for (const [key, value] of Object.entries(resolved?.auth.headers ?? {})) {
         if (typeof value === "string") headers[key] = value;
       }
-      return fetchModels({ baseUrl, api, apiKey, headers }, AbortSignal.timeout(DISCOVERY_TIMEOUT_MS));
+      // Some credentials carry their own endpoint (subscription OAuth), and the
+      // resolved one is what a chat request would actually use.
+      const endpoint = resolved?.auth.baseUrl?.trim() || baseUrl;
+      return fetchModels({ baseUrl: endpoint, api, apiKey, headers }, AbortSignal.timeout(DISCOVERY_TIMEOUT_MS));
     },
 
     currentModelId(providerId: string): string | undefined {

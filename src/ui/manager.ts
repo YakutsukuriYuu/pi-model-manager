@@ -64,12 +64,45 @@ type ModelTarget = "model" | "override";
 
 const ORIGIN_LABEL: Record<ModelOrigin, string> = { config: "配置", override: "覆盖", builtin: "内置" };
 
+/** Where a provider's credential comes from, without exposing the credential. */
+export interface ProviderAuth {
+  configured: boolean;
+  label: string;
+}
+
 export interface ProviderRow {
   id: string;
   name?: string;
   api?: string;
   modelCount: number;
   inConfig: boolean;
+  auth: ProviderAuth;
+}
+
+const NO_AUTH: ProviderAuth = { configured: false, label: "未登录" };
+
+/**
+ * Short label for a credential's origin.
+ *
+ * A provider reached through `/login` is as much the user's as one defined in
+ * models.json, so the list has to tell the two apart instead of hiding one.
+ */
+export function authLabel(source: string | undefined): string {
+  switch (source) {
+    case "stored":
+      return "已登录";
+    case "runtime":
+      return "本次运行";
+    case "environment":
+      return "环境变量";
+    case "fallback":
+      return "扩展";
+    case "models_json_key":
+    case "models_json_command":
+      return "配置";
+    default:
+      return "未登录";
+  }
 }
 
 export interface ProviderDraft {
@@ -112,6 +145,13 @@ export interface ManagerHost {
   catalogMetadata(): Map<string, CatalogModel>;
   /** Configured values used to prefill a provider that has no config yet. */
   providerDefaults(providerId: string): { name?: string; baseUrl?: string; api?: string };
+  /**
+   * Where a provider's credential comes from, if anywhere.
+   *
+   * Read from Pi rather than from models.json, so providers authenticated with
+   * `/login` are visible without ever reading the credential itself.
+   */
+  authStatus(providerId: string): { configured: boolean; source?: string };
   fetchModels(providerId: string, baseUrl: string, api: ProviderApi): Promise<DiscoveredModel[]>;
   currentModelId(providerId: string): string | undefined;
   setModel(providerId: string, modelId: string): Promise<boolean>;
@@ -214,6 +254,7 @@ export function buildProviderRows(
   configProviders: Array<[string, ProviderEntry]>,
   catalogIds: readonly string[],
   catalogCounts: ReadonlyMap<string, number>,
+  authById: ReadonlyMap<string, ProviderAuth> = new Map(),
 ): ProviderRow[] {
   const rows: ProviderRow[] = configProviders.map(([id, entry]) => ({
     id,
@@ -221,11 +262,12 @@ export function buildProviderRows(
     api: typeof entry.api === "string" ? entry.api : undefined,
     modelCount: modelEntries(entry).length || (catalogCounts.get(id) ?? 0),
     inConfig: true,
+    auth: authById.get(id) ?? NO_AUTH,
   }));
   const configured = new Set(rows.map((row) => row.id));
   for (const id of catalogIds) {
     if (configured.has(id)) continue;
-    rows.push({ id, modelCount: catalogCounts.get(id) ?? 0, inConfig: false });
+    rows.push({ id, modelCount: catalogCounts.get(id) ?? 0, inConfig: false, auth: authById.get(id) ?? NO_AUTH });
   }
   return rows.sort((left, right) => {
     if (left.inConfig !== right.inConfig) return left.inConfig ? -1 : 1;
@@ -495,19 +537,29 @@ export class ModelManager implements Component, Focusable {
     const counts = new Map<string, number>();
     for (const [id, entry] of configured) counts.set(id, modelEntries(entry).length);
 
-    const rows = buildProviderRows(configured, this.host.catalogProviderIds(), counts);
-    // Providers with no config are noise: there is nothing of the user's to
-    // manage in them. `b` reveals them for the one case that needs them, which
-    // is writing an override for a model Pi ships.
-    if (!this.showBuiltins) return rows.filter((row) => row.inConfig);
+    // A provider reached through `/login` is as much the user's as one with a
+    // models.json entry, so the credential status decides what is worth
+    // listing rather than the file alone.
+    const auth = new Map<string, ProviderAuth>();
+    const ids = new Set<string>([...configured.map(([id]) => id), ...this.host.catalogProviderIds()]);
+    for (const id of ids) {
+      const status = this.host.authStatus(id);
+      auth.set(id, { configured: status.configured, label: authLabel(status.source) });
+    }
 
-    // Counted only when shown: a built-in provider has models too, and showing
-    // "0" for one would report the opposite of the truth.
-    for (const row of rows) {
+    const rows = buildProviderRows(configured, this.host.catalogProviderIds(), counts, auth);
+    // Providers with neither config nor a credential hold none of the user's
+    // setup, and a list of them buries the ones that do.
+    const visible = this.showBuiltins ? rows : rows.filter((row) => row.inConfig || row.auth.configured);
+
+    // Anything without a config takes its count from Pi's catalog. Reading 0
+    // would report the opposite of the truth — a provider reached through
+    // `/login` does have models.
+    for (const row of visible) {
       if (row.inConfig) continue;
       row.modelCount = this.host.catalogModels(row.id).length;
     }
-    return rows;
+    return visible;
   }
 
   private providerEntry(id: string): ProviderEntry | undefined {
@@ -1201,17 +1253,20 @@ export class ModelManager implements Component, Focusable {
     const rows = this.providerRows();
     const screen = this.screen as Extract<Screen, { kind: "providers" }>;
     const selected = Math.min(screen.index, Math.max(0, rows.length - 1));
-    const configured = rows.filter((row) => row.inConfig).length;
+    const configuredCount = rows.filter((row) => row.inConfig).length;
+    const loggedIn = rows.filter((row) => !row.inConfig && row.auth.configured).length;
+    const modelTotal = rows.reduce((total, row) => total + row.modelCount, 0);
     const columns: Column<ProviderRow>[] = [
       { title: "接入", width: "flex", value: (row) => row.id },
       { title: "协议", width: 22, value: (row) => row.api ?? (row.inConfig ? "继承内置" : "内置") },
+      { title: "认证", width: 9, value: (row) => row.auth.label },
       { title: "来源", width: 6, value: (row) => (row.inConfig ? "配置" : "内置") },
       { title: "模型", width: 5, right: true, value: (row) => String(row.modelCount) },
     ];
     return frame({
       theme: this.theme,
       width,
-      title: `Pi 模型配置 · ${configured} 个接入配置 · ${rows.reduce((total, row) => total + row.modelCount, 0)} 个模型`,
+      title: `Pi 模型配置 · 已配置 ${configuredCount} · 已登录 ${loggedIn} · 模型 ${modelTotal}`,
       meta: [modelsJsonPath()],
       body: table({
         theme: this.theme,

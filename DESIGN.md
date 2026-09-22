@@ -92,6 +92,23 @@ Pi 的 schema 允许额外键。实测用户的 `mimo` 接入里就有另一个�
 
 内置索引会**排除 models.json 里已定义的 Provider**：那是用户自己的配置，用它当参考等于把旧值洗成「Pi 说的」，没有任何新信息。
 
+## 接入列表的可见范围
+
+第一版把「你的接入」等同于「models.json 里的接入」,于是用 `/login` 登录的 deepseek、kimi-coding 这些**完全不显示** —— 但用户的预期是「我登录了就应该看得到」。
+
+现在的规则是并集：
+
+```text
+显示  = models.json 里有配置  ∪  Pi 报告已配置凭据
+隐藏  = 两者都没有（这才是纯噪声）
+```
+
+凭据来源用 `getProviderAuthStatus()` 读,而不是自己解析 `auth.json`。好处是 `/login`、`--api-key`、环境变量、`models.json` 里的 `$ENV_VAR`/`!command` 全部统一,且**插件不接触密钥本身**。
+
+同时修了一个计数错误：模型数只统计了配置里的模型,所以已登录的内置接入显示 `模型 0`，看起来像空条目。现在凡是展示中的非配置行都从 Pi 目录取真实数量。
+
+顺带一提：登录过的接入不需要写 `models.json` 就已经可用。插件的价值在于能 `f` 用同一份凭据去上游发现**更多**模型（实测：deepseek 能解析出 key、endpoint、api，去请求 `https://api.deepseek.com/models`）。
+
 ## 底部区域：提示与键位分离
 
 早期实现里状态信息会**替换**键位提示，结果是操作一次之后就再也看不到按什么键。现在分两行：
@@ -194,16 +211,16 @@ Pi 会拒绝一个什么都不配置的 Provider 条目（报 `must specify ...`
 
 ## 认证
 
-不自己解析 apiKey，而是用 `registry.getProviderAuth(providerId)`：
+不自己解析 apiKey，而是问 Pi：
 
 ```text
-models.json apiKey 字面值
-$ENV_VAR 引用
-!command 命令
-/login 存入 auth.json 的凭据
+getProviderAuthStatus()   仅报告来源与是否可用（不返回密钥）
+getProviderAuth()         解析出真正要用的 apiKey / headers / baseUrl
 ```
 
-四种来源由 Pi 统一解析，插件不用重复实现。
+覆盖 `models.json` 字面值、`$ENV_VAR`、`!command`、`/login` 的 auth.json，以及 `--api-key`。
+
+发现模型时优先用 `getProviderAuth()` 返回的 `baseUrl`（订阅型 OAuth 的 endpoint 来自凭据，而不是目录），这与一次真实请求的取址一致。
 
 ## 边界
 
