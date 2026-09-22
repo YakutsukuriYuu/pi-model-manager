@@ -38,8 +38,14 @@ test("modelsUrl follows each SDK's own API path rules", () => {
   assert.equal(modelsUrl("https://generativelanguage.googleapis.com/v1beta", "google-generative-ai"), "https://generativelanguage.googleapis.com/v1beta/models");
 });
 
-test("parseModels reads OpenAI, Anthropic, Google, and OpenRouter shapes", () => {
+test("parseModels reads OpenAI, Anthropic, Google, OpenRouter, and vLLM shapes", () => {
   assert.deepEqual(parseModels({ data: [{ id: "gpt-x" }] }).map((m) => m.id), ["gpt-x"]);
+
+  // vLLM / SGLang model cards name the served limit `max_model_len`.
+  const vllm = parseModels({ data: [{ id: "local-model", max_model_len: 32_768, max_completion_tokens: 4_096 }] });
+  assert.equal(vllm[0].contextWindow, 32_768);
+  assert.equal(vllm[0].maxTokens, 4_096);
+  assert.equal(vllm[0].sources.contextWindow, "upstream");
 
   const anthropic = parseModels({ data: [{ id: "claude-y", display_name: "Claude Y" }] });
   assert.equal(anthropic[0].name, "Claude Y");

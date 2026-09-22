@@ -141,9 +141,33 @@ function rawId(record: Record<string, unknown>): string | undefined {
 /**
  * Field names real provider lists use for the context window and output cap,
  * including the OpenRouter-style nesting under `top_provider`.
+ *
+ * OpenAI's own spec defines only `id`/`object`/`created`/`owned_by`, so anything
+ * richer is a gateway-specific extension and each one spells it differently:
+ *
+ * - `context_length`            OpenRouter and most marketplaces
+ * - `context_window`            assorted gateways
+ * - `max_model_len`             vLLM / SGLang model cards (the served limit)
+ * - `inputTokenLimit`           Google Generative AI
  */
-const CONTEXT_KEYS = ["contextWindow", "context_window", "context_length", "inputTokenLimit", "input_token_limit", "max_context_length"];
-const OUTPUT_KEYS = ["maxTokens", "max_tokens", "outputTokenLimit", "output_token_limit", "max_output_tokens"];
+const CONTEXT_KEYS = [
+  "contextWindow",
+  "context_window",
+  "context_length",
+  "max_model_len",
+  "inputTokenLimit",
+  "input_token_limit",
+  "max_context_length",
+];
+const OUTPUT_KEYS = [
+  "maxTokens",
+  "max_tokens",
+  "outputTokenLimit",
+  "output_token_limit",
+  "max_output_tokens",
+  "max_completion_tokens",
+  "max_generation_tokens",
+];
 
 /** Tokens that unambiguously mark a capability in a model id. */
 const REASONING_ID = /(?:^|[-_/])(?:reasoning|thinking|r1)(?:$|[-_/])/iu;
