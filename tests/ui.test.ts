@@ -379,13 +379,13 @@ test("edits an existing configured model in place", async () => {
 /** A provider Pi ships: no models.json entry, models come from the catalog. */
 const BUILTIN_CATALOG = { builtin: [{ id: "builtin-model", contextWindow: 128_000, maxTokens: 16_384 }] };
 
-test("editing a built-in model writes a modelOverrides entry", async () => {
+test("editing an inherited model takes it over as a full config entry", async () => {
   const h = harness({}, { catalog: BUILTIN_CATALOG });
   h.manager.handleInput("b"); // built-ins are hidden by default
   h.manager.handleInput(KEY.enter); // into the built-in provider
   h.manager.handleInput("e");
   const form = h.manager.render(120).join("\n");
-  assert.match(form, /覆盖/, "the form says it writes an override");
+  assert.match(form, /接管/, "the form says it takes the model over");
   assert.match(form, /128k/, "the catalog value prefills the form");
 
   // Row 2 is 上下文窗口; the prefilled value is replaced by the first keystroke.
@@ -398,9 +398,38 @@ test("editing a built-in model writes a modelOverrides entry", async () => {
   await tick();
 
   const provider = h.saved.at(-1)?.providers?.builtin;
-  assert.deepEqual(provider?.modelOverrides, { "builtin-model": { contextWindow: 500_000 } });
-  // Pi keeps its own catalog entry; no replacement model is added.
-  assert.equal("models" in (provider ?? {}), false);
+  const models = provider?.models ?? [];
+  assert.deepEqual(models.map((entry) => entry.id), ["builtin-model"]);
+  assert.equal(models[0].contextWindow, 500_000);
+  assert.equal(models[0].maxTokens, 16_384, "the rest of the catalog values come along");
+  // The entry is the config now; nothing is left in an override layer.
+  assert.equal("modelOverrides" in (provider ?? {}), false);
+});
+
+test("t takes over every inherited model at once, after asking", async () => {
+  const h = harness({}, {
+    catalog: { builtin: [{ id: "b1", contextWindow: 1000 }, { id: "b2", contextWindow: 2000 }] },
+  });
+  h.manager.handleInput("b");
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("t");
+  await tick();
+
+  assert.equal(h.saved.length, 0, "a bulk takeover asks first");
+  assert.match(h.manager.render(140).join("\n"), /把 2 个继承模型写入你的配置/);
+
+  h.manager.handleInput("y");
+  await tick();
+  const models = h.saved.at(-1)?.providers?.builtin.models ?? [];
+  assert.deepEqual(models.map((entry) => entry.id), ["b1", "b2"]);
+  assert.equal(models[0].contextWindow, 1000);
+  assert.equal(models[1].contextWindow, 2000);
+
+  // Once taken over there is nothing left to inherit, so the action is inert.
+  h.manager.handleInput("t");
+  await tick();
+  assert.equal(h.saved.length, 1);
+  assert.match(h.manager.render(140).join("\n"), /没有继承自 Pi 目录的模型/);
 });
 
 test("deleting an overridden built-in model removes only the override", async () => {
@@ -442,7 +471,7 @@ test("a built-in model with no override cannot be deleted", async () => {
   await tick();
 
   assert.equal(h.saved.length, 0, "there is nothing to delete yet");
-  assert.match(h.manager.render(140).join("\n"), /没有可删除的配置/);
+  assert.match(h.manager.render(140).join("\n"), /按 e 接管/);
 });
 
 test("a long model list scrolls with the cursor instead of running off screen", () => {
@@ -524,7 +553,7 @@ test("deleting asks for confirmation first", async () => {
   h.manager.handleInput("d");
   await tick();
   assert.equal(h.saved.length, 0, "a single keystroke must not delete anything");
-  assert.match(h.manager.render(120).join("\n"), /y 确认删除/);
+  assert.match(h.manager.render(120).join("\n"), /y 确认/);
 
   // Any other key cancels.
   h.manager.handleInput("n");
@@ -565,7 +594,7 @@ test("providers logged in with /login are listed without any config", () => {
   assert.ok(shown.includes("demo"), "configured providers are listed");
   assert.ok(shown.includes("deepseek"), "a /login credential is enough to be listed");
   assert.ok(!shown.includes("anthropic"), "a provider with neither stays hidden");
-  assert.match(shown, /deepseek\s+内置\s+已登录/su, "the credential source is shown");
+  assert.match(shown, /deepseek\s+openai-completions\*\s+已登录/su, "an inherited protocol is marked, and the source shown");
   assert.match(shown, /demo\s+openai-completions\s+环境变量/su);
 
   // Pi's own catalog is still one keypress away.

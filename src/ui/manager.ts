@@ -59,10 +59,40 @@ export interface ModelRow extends CatalogModel {
   origin: ModelOrigin;
 }
 
-/** A model Pi ships is edited through `modelOverrides`, not a new entry. */
+/** A model that already carries an override is edited in place as an override. */
 type ModelTarget = "model" | "override";
 
-const ORIGIN_LABEL: Record<ModelOrigin, string> = { config: "配置", override: "覆盖", builtin: "内置" };
+const ORIGIN_LABEL: Record<ModelOrigin, string> = { config: "配置", override: "覆盖", builtin: "继承" };
+
+/** The three things the model form can be doing. */
+type FormMode = "model" | "adopt" | "override";
+
+const FORM_LABEL: Record<FormMode, string> = { model: "模型", adopt: "接管", override: "覆盖" };
+
+const FORM_HINT: Record<FormMode, string> = {
+  model: "留空并保存即删除该项；表单未列出的字段会原样保留",
+  adopt: "保存后成为你的完整配置；清空某项不再跟随 Pi 目录，而是回到 Pi 默认（上下文 128k）",
+  override: "写入 modelOverrides，只写你填过的字段；全部清空即删除覆盖",
+};
+
+/**
+ * A complete config entry built from a row's effective values, used when a model
+ * inherited from Pi's catalog is taken over.
+ *
+ * The entry carries every value the model currently resolves to, so it no longer
+ * depends on the catalog. Clearing a field afterwards therefore falls back to
+ * Pi's default (128k context) rather than to the catalog value, which is why the
+ * form states that before you do it.
+ */
+export function entryFromRow(row: ModelRow): ModelEntry {
+  const entry: ModelEntry = { id: row.id };
+  if (row.name) entry.name = row.name;
+  if (row.reasoning) entry.reasoning = true;
+  if (row.image) entry.input = ["text", "image"];
+  if (row.contextWindow !== undefined) entry.contextWindow = row.contextWindow;
+  if (row.maxTokens !== undefined) entry.maxTokens = row.maxTokens;
+  return entry;
+}
 
 /** Where a provider's credential comes from, without exposing the credential. */
 export interface ProviderAuth {
@@ -180,10 +210,8 @@ interface Editing {
 }
 
 /**
- * A destructive action waiting for explicit confirmation.
- *
- * Deletion is irreversible from the UI (the file backup is the only recovery),
- * so it must not happen on a single keystroke.
+ * A write that needs an explicit yes: deleting, or taking over many models at
+ * once. The UI has no undo, so the file backup is the only recovery.
  */
 interface PendingConfirm {
   prompt: string;
@@ -207,7 +235,7 @@ type Screen =
 const NOTICE_TTL_MS = 4_000;
 
 const PROVIDER_ACTIONS: KeyHint[] = [
-  { keys: "↑↓/PgUp/PgDn/Home/End", label: "选择" },
+  { keys: "↑↓/PgUp/PgDn", label: "选择" },
   { keys: "Enter", label: "进入" },
   { keys: "n", label: "新建" },
   { keys: "b", label: "内置" },
@@ -217,12 +245,13 @@ const PROVIDER_ACTIONS: KeyHint[] = [
 ];
 
 const MODEL_ACTIONS: KeyHint[] = [
-  { keys: "↑↓/PgUp/PgDn/Home/End", label: "选择" },
+  { keys: "↑↓/PgUp/PgDn", label: "选择" },
   { keys: "Enter", label: "使用" },
-  { keys: "e", label: "编辑模型" },
-  { keys: "a", label: "添加模型" },
-  { keys: "f", label: "获取模型" },
-  { keys: "p", label: "编辑接入" },
+  { keys: "e", label: "编辑" },
+  { keys: "t", label: "接管" },
+  { keys: "a", label: "添加" },
+  { keys: "f", label: "获取" },
+  { keys: "p", label: "接入" },
   { keys: "d", label: "删除" },
   { keys: "Esc", label: "返回" },
 ];
@@ -236,7 +265,7 @@ const FORM_ACTIONS: KeyHint[] = [
 ];
 
 const FETCH_ACTIONS: KeyHint[] = [
-  { keys: "↑↓/PgUp/PgDn/Home/End", label: "移动" },
+  { keys: "↑↓/PgUp/PgDn", label: "移动" },
   { keys: "Space", label: "勾选" },
   { keys: "u", label: "勾选值不同的" },
   { keys: "a", label: "全选/全不选" },
@@ -559,6 +588,17 @@ export class ModelManager implements Component, Focusable {
       if (row.inConfig) continue;
       row.modelCount = this.host.catalogModels(row.id).length;
     }
+
+    // An entry that omits `api` still has an effective protocol, inherited from
+    // Pi's built-in provider. Printing a bare "inherits" hides the one thing
+    // worth knowing, so show the value and mark where it came from.
+    for (const row of visible) {
+      if (row.api) continue;
+      const inherited = this.host.providerDefaults(row.id).api;
+      if (inherited) row.api = `${inherited}*`;
+      else if (row.inConfig) row.api = "未设置";
+      else row.api = "—";
+    }
     return visible;
   }
 
@@ -747,8 +787,8 @@ export class ModelManager implements Component, Focusable {
     }
   }
 
-  /** Asks before a destructive write; the next non-`y` key cancels. */
-  private confirmDelete(prompt: string, run: () => void): void {
+  /** Asks before a destructive or bulk write; the next non-`y` key cancels. */
+  private confirm(prompt: string, run: () => void): void {
     this.pendingConfirm = { prompt, run };
     this.refresh();
   }
@@ -858,7 +898,7 @@ export class ModelManager implements Component, Focusable {
         return;
       }
       const models = rows.find((candidate) => candidate.id === row.id)?.modelCount ?? 0;
-      this.confirmDelete(`删除接入 ${row.id} 的配置（含 ${models} 个模型）？`, () => {
+      this.confirm(`删除接入 ${row.id} 的配置（含 ${models} 个模型）？`, () => {
         const doc = structuredClone(this.loaded.doc);
         removeProvider(doc, row.id);
         void this.commit(doc, `已删除接入 ${row.id} 的配置`);
@@ -887,25 +927,63 @@ export class ModelManager implements Component, Focusable {
     }
     if (data === "e") {
       if (!row) return;
+      if (!row.inConfig && !row.hasOverride) {
+        // Taking over instead of overriding: the user asked to own the model
+        // outright, and a plain entry is what Pi reads as the finished config.
+        // Nothing is written until the form is saved.
+        this.screen = {
+          kind: "modelForm",
+          providerId: screen.providerId,
+          originalId: row.id,
+          isNew: true,
+          target: "model",
+          draft: draftFromModel(undefined, row, row.id),
+          field: 0,
+        };
+        this.refresh(`接管 ${row.id}：保存后它就完全属于你的配置`);
+        return;
+      }
+      if (row.hasOverride && !row.inConfig) {
+        this.screen = {
+          kind: "modelForm",
+          providerId: screen.providerId,
+          originalId: row.id,
+          isNew: false,
+          target: "override",
+          // The form reflects the override alone: prefilling catalog values
+          // would write them back as overrides just for opening and saving it.
+          draft: draftFromModel(findModelOverride(this.providerEntry(screen.providerId), row.id), undefined, row.id),
+          field: 0,
+        };
+        this.refresh();
+        return;
+      }
       this.screen = {
         kind: "modelForm",
         providerId: screen.providerId,
         originalId: row.id,
         isNew: false,
-        // A model Pi ships has no `models` entry to edit, so the change is
-        // written as an override instead.
-        target: row.inConfig ? "model" : "override",
-        draft: draftFromModel(
-          row.inConfig ? findModel(this.providerEntry(screen.providerId), row.id) : findModelOverride(this.providerEntry(screen.providerId), row.id),
-          // An override form starts from the override alone. Prefilling it from
-          // the catalog would write those values back as overrides just because
-          // the form was opened and saved, pinning the model to today's numbers.
-          row.inConfig ? row : undefined,
-          row.id,
-        ),
+        target: "model",
+        draft: draftFromModel(findModel(this.providerEntry(screen.providerId), row.id), row, row.id),
         field: 0,
       };
       this.refresh();
+      return;
+    }
+    if (data === "t") {
+      // Bulk takeover, so it asks first: this writes one entry per model that
+      // currently comes from Pi's catalog.
+      const inherited = rows.filter((candidate) => !candidate.inConfig);
+      if (inherited.length === 0) {
+        this.refresh("该接入没有继承自 Pi 目录的模型", "warning");
+        return;
+      }
+      this.confirm(`把 ${inherited.length} 个继承模型写入你的配置（之后不再跟随 Pi 目录）？`, () => {
+        const doc = structuredClone(this.loaded.doc);
+        const provider = ensureProvider(doc, screen.providerId);
+        for (const candidate of inherited) upsertModel(provider, entryFromRow(candidate));
+        void this.commit(doc, `已接管 ${inherited.length} 个模型`);
+      });
       return;
     }
     if (data === "p") {
@@ -949,7 +1027,7 @@ export class ModelManager implements Component, Focusable {
     if (data === "d") {
       if (!row) return;
       if (row.inConfig) {
-        this.confirmDelete(`删除模型 ${row.id} 的配置？`, () => {
+        this.confirm(`删除模型 ${row.id} 的配置？`, () => {
           const doc = structuredClone(this.loaded.doc);
           const provider = ensureProvider(doc, screen.providerId);
           removeModel(provider, row.id);
@@ -961,7 +1039,7 @@ export class ModelManager implements Component, Focusable {
         return;
       }
       if (row.hasOverride) {
-        this.confirmDelete(`删除 ${row.id} 的覆盖配置？`, () => {
+        this.confirm(`删除 ${row.id} 的覆盖配置？`, () => {
           const doc = structuredClone(this.loaded.doc);
           removeModelOverride(ensureProvider(doc, screen.providerId), row.id);
           pruneEmptyProvider(doc, screen.providerId);
@@ -969,7 +1047,7 @@ export class ModelManager implements Component, Focusable {
         });
         return;
       }
-      this.refresh(`${row.id} 来自 Pi 内置目录，没有可删除的配置（按 e 可以给它写一条覆盖）`, "warning");
+      this.refresh(`${row.id} 只存在于 Pi 目录，不是你的配置。按 e 接管为你的配置，或按 t 接管该接入下全部继承模型`, "warning");
     }
   }
 
@@ -1196,7 +1274,7 @@ export class ModelManager implements Component, Focusable {
 
   private footer(actions: readonly KeyHint[], width: number): string[] {
     if (this.editing) return hintLines([{ keys: "Enter", label: "确认" }, { keys: "Esc", label: "取消" }], width);
-    if (this.pendingConfirm) return hintLines([{ keys: "y", label: "确认删除" }, { keys: "其他键", label: "取消" }], width);
+    if (this.pendingConfirm) return hintLines([{ keys: "y", label: "确认" }, { keys: "其他键", label: "取消" }], width);
     return hintLines(actions, width);
   }
 
@@ -1258,7 +1336,7 @@ export class ModelManager implements Component, Focusable {
     const modelTotal = rows.reduce((total, row) => total + row.modelCount, 0);
     const columns: Column<ProviderRow>[] = [
       { title: "接入", width: "flex", value: (row) => row.id },
-      { title: "协议", width: 22, value: (row) => row.api ?? (row.inConfig ? "继承内置" : "内置") },
+      { title: "协议", width: 24, value: (row) => row.api ?? "—" },
       { title: "认证", width: 9, value: (row) => row.auth.label },
       { title: "来源", width: 6, value: (row) => (row.inConfig ? "配置" : "内置") },
       { title: "模型", width: 5, right: true, value: (row) => String(row.modelCount) },
@@ -1267,7 +1345,7 @@ export class ModelManager implements Component, Focusable {
       theme: this.theme,
       width,
       title: `Pi 模型配置 · 已配置 ${configuredCount} · 已登录 ${loggedIn} · 模型 ${modelTotal}`,
-      meta: [modelsJsonPath()],
+      meta: [modelsJsonPath(), "* 协议继承自 Pi 内置接入；进去按 p 可显式指定"],
       body: table({
         theme: this.theme,
         width,
@@ -1321,18 +1399,19 @@ export class ModelManager implements Component, Focusable {
 
   private renderProviderForm(width: number): string[] {
     const screen = this.screen as Extract<Screen, { kind: "providerForm" }>;
-    return this.renderForm(width, `接入${screen.isNew ? "" : ` ${screen.providerId}`}`, this.providerFields(screen), screen.field, screen.isNew);
+    const title = screen.isNew ? "新建接入" : `编辑接入 ${screen.providerId}`;
+    return this.renderForm(width, title, this.providerFields(screen), screen.field);
   }
 
   private renderModelForm(width: number): string[] {
     const screen = this.screen as Extract<Screen, { kind: "modelForm" }>;
-    const isOverride = screen.target === "override";
-    const label = isOverride ? "覆盖" : "模型";
-    const hint = isOverride
-      ? "写入 modelOverrides，只写你填过的字段；全部清空即删除覆盖"
-      : "留空并保存即删除该项；表单未列出的字段会原样保留";
-    const meta = [hint];
-    if (isOverride) {
+    let mode: FormMode = "model";
+    if (screen.target === "override") mode = "override";
+    // A new form that already carries an id is taking over a catalog model.
+    else if (screen.isNew && screen.originalId !== "") mode = "adopt";
+
+    const meta = [FORM_HINT[mode]];
+    if (mode === "override") {
       // The form has no prefilled catalog values, so state what is in effect.
       const effective = this.host.catalogModels(screen.providerId).find((model) => model.id === screen.originalId);
       if (effective) {
@@ -1341,10 +1420,14 @@ export class ModelManager implements Component, Focusable {
         );
       }
     }
-    return this.renderForm(width, `${label}${screen.isNew ? "" : ` ${screen.originalId}`}`, this.modelFields(screen), screen.field, screen.isNew, meta);
+    const title = FORM_LABEL[mode];
+    if (mode === "adopt") return this.renderForm(width, `接管 ${screen.originalId}`, this.modelFields(screen), screen.field, meta);
+    if (mode === "override") return this.renderForm(width, `编辑覆盖 ${screen.originalId}`, this.modelFields(screen), screen.field, meta);
+    const named = title + (screen.isNew ? "" : ` ${screen.originalId}`);
+    return this.renderForm(width, screen.isNew ? "新建模型" : `编辑${named}`, this.modelFields(screen), screen.field, meta);
   }
 
-  private renderForm(width: number, what: string, fields: FormField[], selected: number, isNew: boolean, meta?: string[]): string[] {
+  private renderForm(width: number, title: string, fields: FormField[], selected: number, meta?: string[]): string[] {
     const columns: Column<FormField>[] = [
       { title: "字段", width: 13, value: (row) => row.label },
       { title: "", width: "flex", value: (row) => row.value },
@@ -1353,7 +1436,7 @@ export class ModelManager implements Component, Focusable {
     return frame({
       theme: this.theme,
       width,
-      title: `${isNew ? "新建" : "编辑"}${what}`,
+      title,
       meta: this.editing ? [] : (meta ?? ["留空并保存即删除该项；表单未列出的字段会原样保留"]),
       body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "", maxRows: this.maxListRows(), marker: this.markerFor(fields, selected) }),
       footer,
