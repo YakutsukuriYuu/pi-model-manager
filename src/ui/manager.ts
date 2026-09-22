@@ -128,6 +128,17 @@ interface Editing {
   commit(value: string): void;
 }
 
+/**
+ * A destructive action waiting for explicit confirmation.
+ *
+ * Deletion is irreversible from the UI (the file backup is the only recovery),
+ * so it must not happen on a single keystroke.
+ */
+interface PendingConfirm {
+  prompt: string;
+  run(): void;
+}
+
 /** One discovery result plus how it relates to the configured entry. */
 interface FetchRow {
   model: DiscoveredModel;
@@ -396,6 +407,7 @@ export class ModelManager implements Component, Focusable {
   private readonly tui: TUI;
   private readonly theme: ThemeLike;
   private editing: Editing | null = null;
+  private pendingConfirm: PendingConfirm | null = null;
   private status: { text: string; tone: "dim" | "warning" | "error" } | null = null;
   private busy = false;
   private cachedWidth: number | undefined;
@@ -596,6 +608,10 @@ export class ModelManager implements Component, Focusable {
       this.handleEditingInput(data);
       return;
     }
+    if (this.pendingConfirm) {
+      this.handleConfirmInput(data);
+      return;
+    }
     switch (this.screen.kind) {
       case "providers":
         this.handleProviders(data);
@@ -613,6 +629,23 @@ export class ModelManager implements Component, Focusable {
         this.handleFetch(data);
         return;
     }
+  }
+
+  /** Asks before a destructive write; the next non-`y` key cancels. */
+  private confirmDelete(prompt: string, run: () => void): void {
+    this.pendingConfirm = { prompt, run };
+    this.refresh();
+  }
+
+  private handleConfirmInput(data: string): void {
+    const pending = this.pendingConfirm;
+    if (!pending) return;
+    this.pendingConfirm = null;
+    if (data === "y" || data === "Y") {
+      pending.run();
+      return;
+    }
+    this.refresh("已取消");
   }
 
   private handleEditingInput(data: string): void {
@@ -698,9 +731,12 @@ export class ModelManager implements Component, Focusable {
         this.refresh(`${row.id} 是 Pi 内置接入，没有可删除的配置`, "warning");
         return;
       }
-      const doc = structuredClone(this.loaded.doc);
-      removeProvider(doc, row.id);
-      void this.commit(doc, `已删除接入 ${row.id} 的配置`);
+      const models = rows.find((candidate) => candidate.id === row.id)?.modelCount ?? 0;
+      this.confirmDelete(`删除接入 ${row.id} 的配置（含 ${models} 个模型）？`, () => {
+        const doc = structuredClone(this.loaded.doc);
+        removeProvider(doc, row.id);
+        void this.commit(doc, `已删除接入 ${row.id} 的配置`);
+      });
     }
   }
 
@@ -787,20 +823,24 @@ export class ModelManager implements Component, Focusable {
     if (data === "d") {
       if (!row) return;
       if (row.inConfig) {
-        const doc = structuredClone(this.loaded.doc);
-        const provider = ensureProvider(doc, screen.providerId);
-        removeModel(provider, row.id);
-        // An override left behind by the deleted model would be dead config.
-        removeModelOverride(provider, row.id);
-        pruneEmptyProvider(doc, screen.providerId);
-        void this.commit(doc, `已删除模型 ${row.id}`);
+        this.confirmDelete(`删除模型 ${row.id} 的配置？`, () => {
+          const doc = structuredClone(this.loaded.doc);
+          const provider = ensureProvider(doc, screen.providerId);
+          removeModel(provider, row.id);
+          // An override left behind by the deleted model would be dead config.
+          removeModelOverride(provider, row.id);
+          pruneEmptyProvider(doc, screen.providerId);
+          void this.commit(doc, `已删除模型 ${row.id}`);
+        });
         return;
       }
       if (row.hasOverride) {
-        const doc = structuredClone(this.loaded.doc);
-        removeModelOverride(ensureProvider(doc, screen.providerId), row.id);
-        pruneEmptyProvider(doc, screen.providerId);
-        void this.commit(doc, `已删除 ${row.id} 的覆盖配置`);
+        this.confirmDelete(`删除 ${row.id} 的覆盖配置？`, () => {
+          const doc = structuredClone(this.loaded.doc);
+          removeModelOverride(ensureProvider(doc, screen.providerId), row.id);
+          pruneEmptyProvider(doc, screen.providerId);
+          void this.commit(doc, `已删除 ${row.id} 的覆盖配置`);
+        });
         return;
       }
       this.refresh(`${row.id} 来自 Pi 内置目录，没有可删除的配置（按 e 可以给它写一条覆盖）`, "warning");
@@ -1036,6 +1076,9 @@ export class ModelManager implements Component, Focusable {
       // like it appended and then erased the old value.
       const keys = this.editing.fresh ? "输入即替换   Backspace 逐字删   Enter 确认   Esc 取消" : "Enter 确认   Esc 取消";
       return { text: `${this.editing.label}: ${shown}${marker}▌   ${keys}`, tone: "dim" };
+    }
+    if (this.pendingConfirm) {
+      return { text: `${this.pendingConfirm.prompt}   y 确认删除   其他键取消`, tone: "warning" };
     }
     if (this.status) return { text: this.status.text, tone: this.status.tone };
     return { text: actions, tone: "dim" };

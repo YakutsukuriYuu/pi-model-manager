@@ -281,6 +281,7 @@ test("a failed save reports the rollback message", async () => {
   const h = harness(PROVIDER_DOC, { saveOk: false, saveError: "Invalid models.json schema" });
   h.manager.handleInput(KEY.enter);
   h.manager.handleInput("d");
+  h.manager.handleInput("y");
   await tick();
 
   assert.equal(h.saved.length, 0);
@@ -320,6 +321,7 @@ test("deleting removes the entry from the config only", async () => {
   // The configured provider can.
   h.manager.handleInput(KEY.up);
   h.manager.handleInput("d");
+  h.manager.handleInput("y");
   await tick();
   assert.deepEqual(h.saved.at(-1)?.providers, {});
 });
@@ -328,6 +330,7 @@ test("deleting the last model drops the empty models array", async () => {
   const h = harness(PROVIDER_DOC);
   h.manager.handleInput(KEY.enter);
   h.manager.handleInput("d");
+  h.manager.handleInput("y");
   await tick();
   assert.equal("models" in (h.saved.at(-1)?.providers?.demo ?? {}), false);
 });
@@ -384,6 +387,7 @@ test("deleting an overridden built-in model removes only the override", async ()
   assert.match(h.manager.render(120).join("\n"), /覆盖/);
 
   h.manager.handleInput("d");
+  h.manager.handleInput("y");
   await tick();
   // The entry configured nothing else, and Pi rejects an empty provider, so it
   // is removed entirely rather than left behind.
@@ -487,6 +491,43 @@ test("paging and Home/End move around a long list", () => {
   h.manager.handleInput(KEY.end);
   h.manager.handleInput(KEY.pageDown);
   assert.ok(shown().includes("› model-68"), "PgDn stops at the last row");
+});
+
+test("deleting asks for confirmation first", async () => {
+  const h = harness(PROVIDER_DOC);
+  // Model list → delete the one configured model.
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("d");
+  await tick();
+  assert.equal(h.saved.length, 0, "a single keystroke must not delete anything");
+  assert.match(h.manager.render(120).join("\n"), /y 确认删除/);
+
+  // Any other key cancels.
+  h.manager.handleInput("n");
+  await tick();
+  assert.equal(h.saved.length, 0);
+  assert.match(h.manager.render(120).join("\n"), /已取消/);
+
+  // Confirming performs it.
+  h.manager.handleInput("d");
+  h.manager.handleInput("y");
+  await tick();
+  assert.equal(h.saved.length, 1);
+  assert.equal("models" in (h.saved.at(-1)?.providers?.demo ?? {}), false);
+});
+
+test("deleting a provider asks for confirmation and names the model count", async () => {
+  const h = harness(PROVIDER_DOC);
+  h.manager.handleInput("d");
+  await tick();
+
+  const shown = h.manager.render(120).join("\n");
+  assert.match(shown, /删除接入 demo 的配置（含 1 个模型）/);
+  assert.equal(h.saved.length, 0);
+
+  h.manager.handleInput("y");
+  await tick();
+  assert.deepEqual(h.saved.at(-1)?.providers, {});
 });
 
 test("escape closes the manager from the provider list", () => {
