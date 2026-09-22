@@ -1,0 +1,27 @@
+{
+  "name": "pi-model-manager",
+  "version": "0.1.0",
+  "description": "Unified model catalog and model picker for the pi coding agent",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "models", "provider"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.86.1",
+    "@earendil-works/pi-ai": "^0.86.1",
+    "@earendil-works/pi-tui": "^0.86.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
