@@ -309,14 +309,30 @@ test("editing an existing provider keeps untouched fields", async () => {
   assert.equal(provider?.models?.length, 1);
 });
 
+test("built-in providers stay hidden until asked for", () => {
+  const h = harness(PROVIDER_DOC, { catalog: { builtin: [{ id: "b1" }, { id: "b2" }] } });
+
+  const hidden = h.manager.render(120).join("\n");
+  assert.ok(hidden.includes("demo"), "configured providers are listed");
+  assert.ok(!hidden.includes("builtin"), "unconfigured built-ins are not");
+
+  h.manager.handleInput("b");
+  const shown = h.manager.render(120).join("\n");
+  assert.ok(shown.includes("builtin"));
+  // The count must come from Pi's catalog rather than reading as 0.
+  assert.match(shown, /builtin.*内置\s+2/su);
+});
+
 test("deleting removes the entry from the config only", async () => {
   const h = harness(PROVIDER_DOC, { catalog: { builtin: [{ id: "builtin-model" }] } });
+  h.manager.handleInput("b"); // reveal Pi's own providers
 
   // A built-in provider cannot be deleted.
   h.manager.handleInput(KEY.down);
   h.manager.handleInput("d");
   await tick();
   assert.equal(h.saved.length, 0);
+  assert.match(h.manager.render(140).join("\n"), /没有可删除的配置/);
 
   // The configured provider can.
   h.manager.handleInput(KEY.up);
@@ -359,6 +375,7 @@ const BUILTIN_CATALOG = { builtin: [{ id: "builtin-model", contextWindow: 128_00
 
 test("editing a built-in model writes a modelOverrides entry", async () => {
   const h = harness({}, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput("b"); // built-ins are hidden by default
   h.manager.handleInput(KEY.enter); // into the built-in provider
   h.manager.handleInput("e");
   const form = h.manager.render(120).join("\n");
@@ -413,6 +430,7 @@ test("clearing the last override drops the now-empty provider entry", async () =
 
 test("a built-in model with no override cannot be deleted", async () => {
   const h = harness({}, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput("b");
   h.manager.handleInput(KEY.enter);
   h.manager.handleInput("d");
   await tick();

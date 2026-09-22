@@ -30,7 +30,18 @@ import {
   removeProvider,
   upsertModel,
 } from "../models-json.ts";
-import { SELECTED_MARKER, UNSELECTED_MARKER, type Column, type ThemeLike, compactCount, frame, safeTheme, table } from "./frame.ts";
+import {
+  SELECTED_MARKER,
+  UNSELECTED_MARKER,
+  type Column,
+  type KeyHint,
+  type ThemeLike,
+  compactCount,
+  frame,
+  hintLines,
+  safeTheme,
+  table,
+} from "./frame.ts";
 
 /** Re-exported so the extension entry point can build the catalog index. */
 export type { CatalogModel };
@@ -152,10 +163,46 @@ type Screen =
   | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; target: ModelTarget; draft: ModelDraft; field: number }
   | { kind: "fetch"; providerId: string; rows: FetchRow[]; checked: Set<string>; index: number };
 
-const PROVIDER_ACTIONS = "↑↓/PgUp/PgDn/Home/End 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
-const MODEL_ACTIONS = "↑↓/PgUp/PgDn/Home/End 选择   Enter 使用   e 编辑模型   a 添加模型   f 获取模型   p 编辑接入   d 删除   Esc 返回";
-const FORM_ACTIONS = "↑↓ 选择字段   Enter 编辑   ←→ 切换   Ctrl+S 保存   Esc 取消";
-const FETCH_ACTIONS = "↑↓/PgUp/PgDn/Home/End 移动   Space 勾选   u 勾选值不同的   a 全选/全不选   Enter 保存   Esc 取消";
+/** How long a transient message stays before it clears itself. */
+const NOTICE_TTL_MS = 4_000;
+
+const PROVIDER_ACTIONS: KeyHint[] = [
+  { keys: "↑↓/PgUp/PgDn/Home/End", label: "选择" },
+  { keys: "Enter", label: "进入" },
+  { keys: "n", label: "新建" },
+  { keys: "b", label: "内置" },
+  { keys: "r", label: "重载" },
+  { keys: "d", label: "删除" },
+  { keys: "Esc", label: "关闭" },
+];
+
+const MODEL_ACTIONS: KeyHint[] = [
+  { keys: "↑↓/PgUp/PgDn/Home/End", label: "选择" },
+  { keys: "Enter", label: "使用" },
+  { keys: "e", label: "编辑模型" },
+  { keys: "a", label: "添加模型" },
+  { keys: "f", label: "获取模型" },
+  { keys: "p", label: "编辑接入" },
+  { keys: "d", label: "删除" },
+  { keys: "Esc", label: "返回" },
+];
+
+const FORM_ACTIONS: KeyHint[] = [
+  { keys: "↑↓", label: "选择字段" },
+  { keys: "Enter", label: "编辑" },
+  { keys: "←→", label: "切换" },
+  { keys: "Ctrl+S", label: "保存" },
+  { keys: "Esc", label: "取消" },
+];
+
+const FETCH_ACTIONS: KeyHint[] = [
+  { keys: "↑↓/PgUp/PgDn/Home/End", label: "移动" },
+  { keys: "Space", label: "勾选" },
+  { keys: "u", label: "勾选值不同的" },
+  { keys: "a", label: "全选/全不选" },
+  { keys: "Enter", label: "保存" },
+  { keys: "Esc", label: "取消" },
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -403,12 +450,15 @@ export function describeCapabilities(
 
 export class ModelManager implements Component, Focusable {
   private screen: Screen = { kind: "providers", index: 0 };
+  /** Reveals Pi's own providers, which have no config to manage by default. */
+  private showBuiltins = false;
   private loaded: LoadedModels;
   private readonly tui: TUI;
   private readonly theme: ThemeLike;
   private editing: Editing | null = null;
   private pendingConfirm: PendingConfirm | null = null;
   private status: { text: string; tone: "dim" | "warning" | "error" } | null = null;
+  private statusTimer: ReturnType<typeof setTimeout> | null = null;
   private busy = false;
   private cachedWidth: number | undefined;
   private cachedLines: string[] | undefined;
@@ -435,15 +485,29 @@ export class ModelManager implements Component, Focusable {
   // --- state helpers ------------------------------------------------------------
 
   private refresh(message?: string, tone: "dim" | "warning" | "error" = "dim"): void {
-    if (message !== undefined) this.status = { text: message, tone };
+    if (message !== undefined) this.setStatus(message, tone);
     this.invalidate();
     this.tui.requestRender();
   }
 
   private providerRows(): ProviderRow[] {
+    const configured = providerEntries(this.loaded.doc);
     const counts = new Map<string, number>();
-    for (const [id, entry] of providerEntries(this.loaded.doc)) counts.set(id, modelEntries(entry).length);
-    return buildProviderRows(providerEntries(this.loaded.doc), this.host.catalogProviderIds(), counts);
+    for (const [id, entry] of configured) counts.set(id, modelEntries(entry).length);
+
+    const rows = buildProviderRows(configured, this.host.catalogProviderIds(), counts);
+    // Providers with no config are noise: there is nothing of the user's to
+    // manage in them. `b` reveals them for the one case that needs them, which
+    // is writing an override for a model Pi ships.
+    if (!this.showBuiltins) return rows.filter((row) => row.inConfig);
+
+    // Counted only when shown: a built-in provider has models too, and showing
+    // "0" for one would report the opposite of the truth.
+    for (const row of rows) {
+      if (row.inConfig) continue;
+      row.modelCount = this.host.catalogModels(row.id).length;
+    }
+    return rows;
   }
 
   private providerEntry(id: string): ProviderEntry | undefined {
@@ -717,6 +781,16 @@ export class ModelManager implements Component, Focusable {
     if (data === "n") {
       this.screen = { kind: "providerForm", providerId: "", isNew: true, draft: draftFromProvider("", undefined, {}), field: 0 };
       this.refresh();
+      return;
+    }
+    if (data === "b") {
+      this.showBuiltins = !this.showBuiltins;
+      this.screen = { ...screen, index: 0 };
+      this.refresh(
+        this.showBuiltins
+          ? "已显示 Pi 内置接入：进入后按 e 可给内置模型写覆盖"
+          : "已隐藏未配置的内置接入",
+      );
       return;
     }
     if (data === "r") {
@@ -1068,20 +1142,48 @@ export class ModelManager implements Component, Focusable {
     return this.cachedLines;
   }
 
-  private footer(actions: string): { text: string; tone: "dim" | "warning" | "error" } {
+  private footer(actions: readonly KeyHint[], width: number): string[] {
+    if (this.editing) return hintLines([{ keys: "Enter", label: "确认" }, { keys: "Esc", label: "取消" }], width);
+    if (this.pendingConfirm) return hintLines([{ keys: "y", label: "确认删除" }, { keys: "其他键", label: "取消" }], width);
+    return hintLines(actions, width);
+  }
+
+  /**
+   * The line above the hints: what just happened, or what is being asked.
+   *
+   * Hints are rendered separately and always. Replacing them with a status
+   * message leaves the reader without any way to see what the keys do.
+   */
+  private notice(): { text: string; tone: "dim" | "warning" | "error" } | undefined {
     if (this.editing) {
       const marker = this._focused ? CURSOR_MARKER : "";
       const shown = this.editing.secret ? "•".repeat(this.editing.buffer.length) : this.editing.buffer;
-      // The hint has to state the replace rule, or the first keystroke looks
-      // like it appended and then erased the old value.
-      const keys = this.editing.fresh ? "输入即替换   Backspace 逐字删   Enter 确认   Esc 取消" : "Enter 确认   Esc 取消";
-      return { text: `${this.editing.label}: ${shown}${marker}▌   ${keys}`, tone: "dim" };
+      const rule = this.editing.fresh ? "（输入即替换，Backspace 逐字删）" : "";
+      return { text: `${this.editing.label}: ${shown}${marker}▌ ${rule}`, tone: "dim" };
     }
-    if (this.pendingConfirm) {
-      return { text: `${this.pendingConfirm.prompt}   y 确认删除   其他键取消`, tone: "warning" };
+    if (this.pendingConfirm) return { text: this.pendingConfirm.prompt, tone: "warning" };
+    return this.status ?? undefined;
+  }
+
+  /**
+   * Sets a transient message and drops it after a moment so it does not become
+   * furniture. Problems persist until the next action replaces them.
+   */
+  private setStatus(text: string | undefined, tone: "dim" | "warning" | "error" = "dim"): void {
+    if (this.statusTimer !== null) {
+      clearTimeout(this.statusTimer);
+      this.statusTimer = null;
     }
-    if (this.status) return { text: this.status.text, tone: this.status.tone };
-    return { text: actions, tone: "dim" };
+    this.status = text === undefined ? null : { text, tone };
+    if (text !== undefined && tone === "dim") {
+      this.statusTimer = setTimeout(() => {
+        this.statusTimer = null;
+        this.status = null;
+        this.invalidate();
+        this.tui.requestRender();
+      }, NOTICE_TTL_MS);
+      this.statusTimer.unref?.();
+    }
   }
 
   /**
@@ -1118,11 +1220,11 @@ export class ModelManager implements Component, Focusable {
         rows,
         selected,
         marker: this.markerFor(rows, selected),
-        empty: "没有任何接入。按 n 新建，填 Base URL 和 API Key 即可自动获取模型。",
+        empty: "没有任何接入配置。按 n 新建（只需 Base URL + API Key）；按 b 显示 Pi 内置接入，以给内置模型写覆盖。",
         maxRows: this.maxListRows(),
       }),
-      footer: this.footer(PROVIDER_ACTIONS).text,
-      footerTone: this.footer(PROVIDER_ACTIONS).tone,
+      footer: this.footer(PROVIDER_ACTIONS, width),
+      notice: this.notice(),
     });
   }
 
@@ -1141,7 +1243,7 @@ export class ModelManager implements Component, Focusable {
       { title: "能力", width: 12, value: (row) => describeCapabilities(row) },
       { title: "来源", width: 6, value: (row) => ORIGIN_LABEL[row.origin] },
     ];
-    const footer = this.footer(MODEL_ACTIONS);
+    const footer = this.footer(MODEL_ACTIONS, width);
     return frame({
       theme: this.theme,
       width,
@@ -1157,8 +1259,8 @@ export class ModelManager implements Component, Focusable {
         empty: "该接入还没有模型。按 f 从上游获取，或按 a 手动添加。",
         maxRows: this.maxListRows(),
       }),
-      footer: footer.text,
-      footerTone: footer.tone,
+      footer,
+      notice: this.notice(),
     });
   }
 
@@ -1192,15 +1294,15 @@ export class ModelManager implements Component, Focusable {
       { title: "字段", width: 13, value: (row) => row.label },
       { title: "", width: "flex", value: (row) => row.value },
     ];
-    const footer = this.footer(FORM_ACTIONS);
+    const footer = this.footer(FORM_ACTIONS, width);
     return frame({
       theme: this.theme,
       width,
       title: `${isNew ? "新建" : "编辑"}${what}`,
       meta: this.editing ? [] : (meta ?? ["留空并保存即删除该项；表单未列出的字段会原样保留"]),
       body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "", maxRows: this.maxListRows(), marker: this.markerFor(fields, selected) }),
-      footer: footer.text,
-      footerTone: footer.tone,
+      footer,
+      notice: this.notice(),
     });
   }
 
@@ -1216,7 +1318,7 @@ export class ModelManager implements Component, Focusable {
       { title: "能力", width: 13, value: (row) => describeCapabilities(row.model, row.model.sources) },
       { title: "状态", width: 6, value: (row) => STATUS_LABEL[row.state] },
     ];
-    const footer = this.footer(FETCH_ACTIONS);
+    const footer = this.footer(FETCH_ACTIONS, width);
     return frame({
       theme: this.theme,
       width,
@@ -1235,8 +1337,8 @@ export class ModelManager implements Component, Focusable {
         empty: "上游没有返回任何模型",
         maxRows: this.maxListRows(),
       }),
-      footer: footer.text,
-      footerTone: footer.tone,
+      footer,
+      notice: this.notice(),
     });
   }
 

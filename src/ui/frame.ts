@@ -146,9 +146,15 @@ export interface FrameOptions {
   /** Secondary lines under the title, already plain text. */
   meta?: string[];
   body: string[];
-  footer: string;
-  /** Rendered in place of the default footer color when it reports a problem. */
-  footerTone?: "dim" | "warning" | "error";
+  /** Key hints. More than one line is allowed so nothing gets truncated away. */
+  footer: string[];
+  /**
+   * Result of the last action, on its own line above the hints.
+   *
+   * A status that replaces the hints leaves the reader without any way to see
+   * what the keys do.
+   */
+  notice?: { text: string; tone: "dim" | "warning" | "error" };
 }
 
 export function frame(options: FrameOptions): string[] {
@@ -162,13 +168,65 @@ export function frame(options: FrameOptions): string[] {
   lines.push(rule);
   lines.push(...options.body);
   lines.push(rule);
-  lines.push(truncateToWidth(theme.fg(options.footerTone ?? "dim", ` ${options.footer}`), width, ""));
+  if (options.notice) {
+    lines.push(truncateToWidth(theme.fg(options.notice.tone, ` ${options.notice.text}`), width, ""));
+  }
+  for (const line of options.footer) {
+    lines.push(truncateToWidth(theme.fg("dim", ` ${line}`), width, ""));
+  }
   lines.push(theme.fg("borderAccent", "─".repeat(Math.max(1, width))));
   return lines.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "") : line));
 }
 
-export function hint(parts: Array<[key: string, label: string]>): string {
-  return parts.map(([key, label]) => `${key} ${label}`).join("  ·  ");
+export interface KeyHint {
+  keys: string;
+  label: string;
+}
+
+/**
+ * Lays out key hints over at most `maxLines` lines.
+ *
+ * A single line silently truncates on a narrow terminal, and whatever is cut is
+ * the hint that happened to come last — usually the one explaining how to leave
+ * the screen. Wrapping keeps every hint; when even that is not enough, the
+ * final hint is preserved instead of dropped.
+ */
+export function hintLines(hints: readonly KeyHint[], width: number, maxLines = 2): string[] {
+  const budget = Math.max(8, width - 2);
+  const lines: string[] = [];
+  let current = "";
+  let index = 0;
+
+  const flush = (): void => {
+    if (current.length > 0) lines.push(current);
+    current = "";
+  };
+
+  for (; index < hints.length; index++) {
+    const hint = hints[index];
+    if (hint === undefined) continue;
+    const piece = `${hint.keys} ${hint.label}`;
+    const candidate = current.length === 0 ? piece : `${current}   ${piece}`;
+    if (visibleWidth(candidate) <= budget) {
+      current = candidate;
+      continue;
+    }
+    if (lines.length === maxLines - 1) break;
+    flush();
+    current = piece;
+  }
+  flush();
+
+  if (index < hints.length && lines.length > 0) {
+    const last = hints.at(-1);
+    if (last) {
+      const tail = `${last.keys} ${last.label}`;
+      const room = budget - visibleWidth(tail) - visibleWidth("…   ");
+      const head = lines.at(-1) ?? "";
+      lines[lines.length - 1] = room > 0 ? `${truncateToWidth(head, room, "")}…   ${tail}` : tail;
+    }
+  }
+  return lines.slice(0, maxLines);
 }
 
 export function compactCount(value: number | undefined): string {

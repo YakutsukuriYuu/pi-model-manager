@@ -25,10 +25,19 @@ pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 ### 接入列表
 
 ```text
-↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭
+↑↓/PgUp/PgDn/Home/End 选择   Enter 进入   n 新建   b 内置   r 重载   d 删除   Esc 关闭
 ```
 
-列表里既有 `models.json` 里的接入（来源显示「配置」，可编辑可删除），也有 Pi 内置接入（来源显示「内置」，可以进入查看、给它们写配置覆盖）。
+列表默认**只显示你在 `models.json` 里配置过的接入**。没有配置的 Pi 内置接入不显示 —— 它们里面没有你的东西。
+
+需要给**内置模型**写覆盖时按 `b`，会列出 Pi 自带的接入，模型数来自 Pi 的目录：
+
+```text
+  接入              协议                来源    模型
+› commandcode       openai-completions  配置      15
+  anthropic         内置                内置      12
+  openai            内置                内置       9
+```
 
 ### 新建接入
 
@@ -71,6 +80,19 @@ pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 - `f` 重新从上游获取，自动填上上下文窗口，并补齐缺失的模型
 - `p` 编辑接入（Base URL、API Key、协议、authHeader、请求头）
 - `d` 删除该模型的配置
+
+## 底部两行
+
+提示信息和键位提示**分别占一行**，不会互相覆盖：
+
+```text
+ 删除模型 deepseek/deepseek-v4-pro 的配置？     ← 上一个操作/当前提问
+ y 确认删除   其他键 取消                        ← 键位提示，始终存在
+```
+
+临时信息（如「已保存」）4 秒后自动消失；错误和警告会一直留着直到下一个操作。
+
+键位提示放不下时会折成两行；如果两行还装不下，会截断中间并**保留最后一个提示**（通常是 `Esc` 返回）—— 单调截断时丢的恰好是它。
 
 ## 编辑能力
 
