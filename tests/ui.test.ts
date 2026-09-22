@@ -115,6 +115,9 @@ test("renders every screen within the terminal width", async () => {
   h.manager.handleInput(KEY.enter);
   assertRenders(h.manager, "models");
   h.manager.handleInput("e");
+  assertRenders(h.manager, "modelForm (edit existing)");
+  h.manager.handleInput(KEY.escape);
+  h.manager.handleInput("p");
   assertRenders(h.manager, "providerForm");
   h.manager.handleInput(KEY.down);
   h.manager.handleInput(KEY.right);
@@ -275,7 +278,7 @@ test("a failed save reports the rollback message", async () => {
 test("editing an existing provider keeps untouched fields", async () => {
   const h = harness(PROVIDER_DOC);
   h.manager.handleInput(KEY.enter);
-  h.manager.handleInput("e");
+  h.manager.handleInput("p");
   // Row 0 is 接入 ID, which is read-only for an existing provider.
   h.manager.handleInput(KEY.down);
   h.manager.handleInput(KEY.enter);
@@ -315,6 +318,91 @@ test("deleting the last model drops the empty models array", async () => {
   h.manager.handleInput("d");
   await tick();
   assert.equal("models" in (h.saved.at(-1)?.providers?.demo ?? {}), false);
+});
+
+test("edits an existing configured model in place", async () => {
+  const h = harness(PROVIDER_DOC);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("e");
+  // Row 0 is the model id (read-only for an existing model); row 2 is 上下文窗口.
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("200000");
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput(KEY.save);
+  await tick();
+
+  const model = h.saved.at(-1)?.providers?.demo.models?.find((entry) => entry.id === "demo-model");
+  assert.equal(model?.contextWindow, 200_000);
+  assert.equal(model?.reasoning, true, "untouched fields survive");
+  assert.equal(h.saved.at(-1)?.providers?.demo.baseUrl, "https://api.example.com/v1", "the provider is not rewritten");
+});
+
+/** A provider Pi ships: no models.json entry, models come from the catalog. */
+const BUILTIN_CATALOG = { builtin: [{ id: "builtin-model", contextWindow: 128_000, maxTokens: 16_384 }] };
+
+test("editing a built-in model writes a modelOverrides entry", async () => {
+  const h = harness({}, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput(KEY.enter); // into the built-in provider
+  h.manager.handleInput("e");
+  const form = h.manager.render(120).join("\n");
+  assert.match(form, /覆盖/, "the form says it writes an override");
+  assert.match(form, /128k/, "the catalog value prefills the form");
+
+  // Row 2 is 上下文窗口; the prefilled value is replaced by the first keystroke.
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("500000");
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput(KEY.save);
+  await tick();
+
+  const provider = h.saved.at(-1)?.providers?.builtin;
+  assert.deepEqual(provider?.modelOverrides, { "builtin-model": { contextWindow: 500_000 } });
+  // Pi keeps its own catalog entry; no replacement model is added.
+  assert.equal("models" in (provider ?? {}), false);
+});
+
+test("deleting an overridden built-in model removes only the override", async () => {
+  const doc: ModelsDocument = { providers: { builtin: { modelOverrides: { "builtin-model": { contextWindow: 500_000 } } } } };
+  const h = harness(doc, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput(KEY.enter);
+  assert.match(h.manager.render(120).join("\n"), /覆盖/);
+
+  h.manager.handleInput("d");
+  await tick();
+  // The entry configured nothing else, and Pi rejects an empty provider, so it
+  // is removed entirely rather than left behind.
+  assert.deepEqual(h.saved.at(-1)?.providers, {});
+});
+
+test("clearing the last override drops the now-empty provider entry", async () => {
+  const doc: ModelsDocument = { providers: { builtin: { modelOverrides: { "builtin-model": { contextWindow: 500_000 } } } } };
+  const h = harness(doc, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("e");
+  // Clear 上下文窗口 by deleting the prefilled value one character at a time.
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  for (let i = 0; i < 6; i++) h.manager.handleInput(KEY.backspace);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput(KEY.save);
+  await tick();
+
+  assert.deepEqual(h.saved.at(-1)?.providers, {}, "an empty provider entry would be rejected by Pi");
+});
+
+test("a built-in model with no override cannot be deleted", async () => {
+  const h = harness({}, { catalog: BUILTIN_CATALOG });
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("d");
+  await tick();
+
+  assert.equal(h.saved.length, 0, "there is nothing to delete yet");
+  assert.match(h.manager.render(140).join("\n"), /没有可删除的配置/);
 });
 
 test("escape closes the manager from the provider list", () => {

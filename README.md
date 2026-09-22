@@ -49,14 +49,45 @@ pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 ### 模型列表
 
 ```text
-↑↓ 选择   Enter 使用   e 编辑接入   a 添加模型   f 获取模型   d 删除   Esc 返回
+↑↓ 选择   Enter 使用   e 编辑模型   a 添加模型   f 获取模型   p 编辑接入   d 删除   Esc 返回
 ```
 
 - `Enter` 把该模型设为当前会话模型
-- `e` 编辑接入（Base URL、API Key、协议、authHeader、请求头）
+- `e` 编辑选中模型的字段（上下文窗口、最大输出、思考、图片、显示名）
 - `a` 手动添加一个模型
 - `f` 重新从上游获取，自动填上上下文窗口，并补齐缺失的模型
-- `d` 删除模型配置
+- `p` 编辑接入（Base URL、API Key、协议、authHeader、请求头）
+- `d` 删除该模型的配置
+
+## 编辑能力
+
+「来源」列告诉你一个模型存在哪里，也决定了编辑时写到哪：
+
+| 来源 | 含义 | 编辑 | 删除 |
+| --- | --- | --- | --- |
+| **配置** | 在 `models.json` 的 `models` 里 | 直接改 | 删除该条目 |
+| **覆盖** | Pi 内置模型 + 你写的 `modelOverrides` | 改覆盖项 | 删除覆盖项 |
+| **内置** | 只在 Pi 的内置目录里 | 按 `e` 会创建一条覆盖 | 无可删（先按 `e` 写覆盖） |
+
+Pi 的内置目录是生成出来的元数据，不能改。所以编辑内置模型时，插件在 `models.json` 里写一条 `modelOverrides`，由 Pi 按字段合并到目录模型之上：
+
+```json
+{
+  "providers": {
+    "amazon-bedrock": {
+      "modelOverrides": {
+        "amazon.nova-2-lite-v1:0": { "contextWindow": 424242, "maxTokens": 7777 }
+      }
+    }
+  }
+}
+```
+
+实测效果：内置模型的 `contextWindow` 从 1000000 变成 424242，而未覆盖的字段（`input`、`reasoning`、`cost`）全部保留。
+
+编辑内置模型时，表单**不会**把目录里的值预填成覆盖内容，否则你只是打开就保存也会把这些数字钉死；表单上方会单列一行「当前生效」告诉你现在实际用的是什么。
+
+编辑字段时：Enter 开始编辑，**第一个输入字符会替换旧值**（否则在 `1000` 后面接 `200000` 会变成 `1000200000`），要逐字改先按 Backspace。
 
 ## API Key 的写法
 

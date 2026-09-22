@@ -13,14 +13,20 @@ import {
 import {
   type LoadedModels,
   type ModelEntry,
+  type ModelOverrideEntry,
   type ModelsDocument,
   type ProviderEntry,
+  ensureModelOverrides,
   ensureProvider,
   findModel,
+  findModelOverride,
   modelEntries,
+  modelOverridesOf,
   modelsJsonPath,
+  pruneEmptyProvider,
   providerEntries,
   removeModel,
+  removeModelOverride,
   removeProvider,
   upsertModel,
 } from "../models-json.ts";
@@ -29,11 +35,23 @@ import { type Column, type ThemeLike, compactCount, frame, safeTheme, table } fr
 /** Re-exported so the extension entry point can build the catalog index. */
 export type { CatalogModel };
 
+/** Where a row's effective values come from. */
+export type ModelOrigin = "config" | "override" | "builtin";
+
 export interface ModelRow extends CatalogModel {
-  /** Present in models.json, so editable and deletable. */
+  /** Present in the provider's `models` list. */
   inConfig: boolean;
+  /** Has a `modelOverrides` entry, which Pi merges over the catalog model. */
+  hasOverride: boolean;
   current: boolean;
+  /** Effective source of the displayed values. */
+  origin: ModelOrigin;
 }
+
+/** A model Pi ships is edited through `modelOverrides`, not a new entry. */
+type ModelTarget = "model" | "override";
+
+const ORIGIN_LABEL: Record<ModelOrigin, string> = { config: "配置", override: "覆盖", builtin: "内置" };
 
 export interface ProviderRow {
   id: string;
@@ -101,6 +119,12 @@ interface Editing {
   label: string;
   buffer: string;
   secret: boolean;
+  /**
+   * True while the buffer still holds an untouched previous value. The first
+   * typed character replaces it, because appending to a prefilled field is how
+   * a value like `1000` silently becomes `1000200000`.
+   */
+  fresh: boolean;
   commit(value: string): void;
 }
 
@@ -114,11 +138,11 @@ type Screen =
   | { kind: "providers"; index: number }
   | { kind: "models"; providerId: string; index: number }
   | { kind: "providerForm"; providerId: string; isNew: boolean; draft: ProviderDraft; field: number }
-  | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; draft: ModelDraft; field: number }
+  | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; target: ModelTarget; draft: ModelDraft; field: number }
   | { kind: "fetch"; providerId: string; rows: FetchRow[]; checked: Set<string>; index: number };
 
 const PROVIDER_ACTIONS = "↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
-const MODEL_ACTIONS = "↑↓ 选择   Enter 使用   e 编辑接入   a 添加模型   f 获取模型   d 删除   Esc 返回";
+const MODEL_ACTIONS = "↑↓ 选择   Enter 使用   e 编辑模型   a 添加模型   f 获取模型   p 编辑接入   d 删除   Esc 返回";
 const FORM_ACTIONS = "↑↓ 选择字段   Enter 编辑   ←→ 切换   Ctrl+S 保存   Esc 取消";
 const FETCH_ACTIONS = "↑↓ 移动   Space 勾选   u 勾选值不同的   a 全选/全不选   Enter 保存   Esc 取消";
 
@@ -151,29 +175,85 @@ export function buildProviderRows(
   });
 }
 
+function pickString(source: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = source?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function pickNumber(source: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = source?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function pickBoolean(source: Record<string, unknown> | undefined, key: string): boolean | undefined {
+  const value = source?.[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function pickImage(source: Record<string, unknown> | undefined): boolean | undefined {
+  const input = source?.input;
+  return Array.isArray(input) ? input.includes("image") : undefined;
+}
+
+type DisplayValues = Pick<ModelRow, "name" | "contextWindow" | "maxTokens" | "reasoning" | "image">;
+
+/**
+ * Overlays a `modelOverrides` entry the way Pi does: field by field, with the
+ * override winning. Pi applies overrides last, so the displayed values have to
+ * be merged in the same order or the list would disagree with the runtime.
+ */
+function applyOverride(base: DisplayValues, override: ModelOverrideEntry | undefined): DisplayValues {
+  if (!override) return base;
+  return {
+    name: pickString(override, "name") ?? base.name,
+    contextWindow: pickNumber(override, "contextWindow") ?? base.contextWindow,
+    maxTokens: pickNumber(override, "maxTokens") ?? base.maxTokens,
+    reasoning: pickBoolean(override, "reasoning") ?? base.reasoning,
+    image: pickImage(override) ?? base.image,
+  };
+}
+
 export function buildModelRows(
   configModels: readonly ModelEntry[],
   catalog: readonly CatalogModel[],
   currentId: string | undefined,
+  overrides: Record<string, ModelOverrideEntry> = {},
 ): ModelRow[] {
   const known = new Map(catalog.map((model) => [model.id, model]));
   const rows: ModelRow[] = configModels.map((entry) => {
     const fallback = known.get(entry.id);
+    const override = overrides[entry.id];
+    const values = applyOverride(
+      {
+        name: pickString(entry, "name") ?? fallback?.name,
+        contextWindow: pickNumber(entry, "contextWindow") ?? fallback?.contextWindow,
+        maxTokens: pickNumber(entry, "maxTokens") ?? fallback?.maxTokens,
+        reasoning: pickBoolean(entry, "reasoning") ?? fallback?.reasoning,
+        image: pickImage(entry) ?? fallback?.image,
+      },
+      override,
+    );
     return {
       id: entry.id,
-      name: typeof entry.name === "string" ? entry.name : fallback?.name,
-      contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : fallback?.contextWindow,
-      maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : fallback?.maxTokens,
-      reasoning: typeof entry.reasoning === "boolean" ? entry.reasoning : fallback?.reasoning,
-      image: Array.isArray(entry.input) ? entry.input.includes("image") : fallback?.image,
+      ...values,
       inConfig: true,
+      hasOverride: override !== undefined,
       current: entry.id === currentId,
+      origin: override ? "override" : "config",
     };
   });
   const configured = new Set(rows.map((row) => row.id));
   for (const model of catalog) {
     if (configured.has(model.id)) continue;
-    rows.push({ ...model, inConfig: false, current: model.id === currentId });
+    const override = overrides[model.id];
+    rows.push({
+      id: model.id,
+      ...applyOverride(model, override),
+      inConfig: false,
+      hasOverride: override !== undefined,
+      current: model.id === currentId,
+      origin: override ? "override" : "builtin",
+    });
   }
   return rows;
 }
@@ -214,7 +294,7 @@ export function applyProviderDraft(existing: ProviderEntry, draft: ProviderDraft
   setOrDelete(existing, "headers", draft.headers && Object.keys(draft.headers).length > 0 ? draft.headers : undefined);
 }
 
-export function applyModelDraft(existing: ModelEntry, draft: ModelDraft): void {
+export function applyModelDraft(existing: Record<string, unknown>, draft: ModelDraft): void {
   setOrDelete(existing, "name", draft.name?.trim() || undefined);
   setOrDelete(existing, "reasoning", draft.reasoning === true ? true : undefined);
   // Pi defaults to text-only, so "text" alone is expressed by removing the key.
@@ -240,14 +320,24 @@ export function draftFromProvider(
   };
 }
 
-export function draftFromModel(entry: ModelEntry | undefined, fallback: CatalogModel | undefined): ModelDraft {
+/**
+ * Builds a draft from either a `models` entry or a `modelOverrides` entry.
+ *
+ * An override body carries no id (the key is the id), so `explicitId` supplies
+ * it for the form, and a catalog model supplies values for untouched fields.
+ */
+export function draftFromModel(
+  entry: Record<string, unknown> | undefined,
+  fallback: CatalogModel | undefined,
+  explicitId?: string,
+): ModelDraft {
   return {
-    id: entry?.id ?? fallback?.id ?? "",
-    name: typeof entry?.name === "string" ? entry.name : undefined,
-    contextWindow: typeof entry?.contextWindow === "number" ? entry.contextWindow : fallback?.contextWindow,
-    maxTokens: typeof entry?.maxTokens === "number" ? entry.maxTokens : fallback?.maxTokens,
-    reasoning: typeof entry?.reasoning === "boolean" ? entry.reasoning : fallback?.reasoning,
-    image: Array.isArray(entry?.input) ? entry.input.includes("image") : fallback?.image,
+    id: explicitId ?? pickString(entry, "id") ?? fallback?.id ?? "",
+    name: pickString(entry, "name"),
+    contextWindow: pickNumber(entry, "contextWindow") ?? fallback?.contextWindow,
+    maxTokens: pickNumber(entry, "maxTokens") ?? fallback?.maxTokens,
+    reasoning: pickBoolean(entry, "reasoning") ?? fallback?.reasoning,
+    image: pickImage(entry) ?? fallback?.image,
   };
 }
 
@@ -349,7 +439,13 @@ export class ModelManager implements Component, Focusable {
   }
 
   private modelRows(providerId: string): ModelRow[] {
-    return buildModelRows(modelEntries(this.providerEntry(providerId)), this.host.catalogModels(providerId), this.host.currentModelId(providerId));
+    const provider = this.providerEntry(providerId);
+    return buildModelRows(
+      modelEntries(provider),
+      this.host.catalogModels(providerId),
+      this.host.currentModelId(providerId),
+      modelOverridesOf(provider),
+    );
   }
 
   private providerDefaults(providerId: string): { name?: string; baseUrl?: string; api?: string } {
@@ -396,6 +492,28 @@ export class ModelManager implements Component, Focusable {
     }
     const doc = structuredClone(this.loaded.doc);
     const provider = ensureProvider(doc, screen.providerId);
+
+    if (screen.target === "override") {
+      // Pi keeps catalog models in generated metadata, so a change to one is
+      // stored as an override that Pi merges over the catalog entry.
+      const overrides = ensureModelOverrides(provider);
+      const body: Record<string, unknown> = { ...overrides[screen.draft.id] };
+      applyModelDraft(body, screen.draft);
+      delete body.id;
+      if (!screen.isNew && screen.originalId !== screen.draft.id) delete overrides[screen.originalId];
+      const cleared = Object.keys(body).length === 0;
+      if (cleared) delete overrides[screen.draft.id];
+      else overrides[screen.draft.id] = body;
+      if (Object.keys(overrides).length === 0) delete provider.modelOverrides;
+      // A provider entry that configures nothing is rejected by Pi, so the
+      // entry has to disappear once its last override is cleared.
+      pruneEmptyProvider(doc, screen.providerId);
+      if (await this.commit(doc, cleared ? `已清空 ${screen.draft.id} 的覆盖配置` : `已保存 ${screen.draft.id} 的覆盖配置`)) {
+        this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
+      }
+      return;
+    }
+
     const existing = findModel(provider, screen.draft.id) ?? { id: screen.draft.id };
     applyModelDraft(existing, screen.draft);
     if (!screen.isNew && screen.originalId !== screen.draft.id) removeModel(provider, screen.originalId);
@@ -498,12 +616,12 @@ export class ModelManager implements Component, Focusable {
       return;
     }
     if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
-      this.editing = { ...editing, buffer: editing.buffer.slice(0, -1) };
+      this.editing = { ...editing, buffer: editing.buffer.slice(0, -1), fresh: false };
       this.refresh();
       return;
     }
     if (data.length > 0 && !data.includes("\x1b") && [...data].every((char) => char >= " ")) {
-      this.editing = { ...editing, buffer: editing.buffer + data };
+      this.editing = { ...editing, buffer: (editing.fresh ? "" : editing.buffer) + data, fresh: false };
       this.refresh();
     }
   }
@@ -583,6 +701,29 @@ export class ModelManager implements Component, Focusable {
       return;
     }
     if (data === "e") {
+      if (!row) return;
+      this.screen = {
+        kind: "modelForm",
+        providerId: screen.providerId,
+        originalId: row.id,
+        isNew: false,
+        // A model Pi ships has no `models` entry to edit, so the change is
+        // written as an override instead.
+        target: row.inConfig ? "model" : "override",
+        draft: draftFromModel(
+          row.inConfig ? findModel(this.providerEntry(screen.providerId), row.id) : findModelOverride(this.providerEntry(screen.providerId), row.id),
+          // An override form starts from the override alone. Prefilling it from
+          // the catalog would write those values back as overrides just because
+          // the form was opened and saved, pinning the model to today's numbers.
+          row.inConfig ? row : undefined,
+          row.id,
+        ),
+        field: 0,
+      };
+      this.refresh();
+      return;
+    }
+    if (data === "p") {
       const entry = this.providerEntry(screen.providerId);
       this.screen = {
         kind: "providerForm",
@@ -600,6 +741,7 @@ export class ModelManager implements Component, Focusable {
         providerId: screen.providerId,
         originalId: "",
         isNew: true,
+        target: "model",
         draft: draftFromModel(undefined, undefined),
         field: 0,
       };
@@ -612,7 +754,7 @@ export class ModelManager implements Component, Focusable {
       const baseUrl = (typeof entry?.baseUrl === "string" && entry.baseUrl) || defaults.baseUrl || "";
       const api = (typeof entry?.api === "string" && entry.api) || defaults.api || "openai-completions";
       if (!baseUrl) {
-        this.refresh("该接入还没有 Base URL，先按 e 编辑接入", "warning");
+        this.refresh("该接入还没有 Base URL，先按 p 编辑接入", "warning");
         return;
       }
       const known = (SUPPORTED_APIS as readonly string[]).includes(api) ? (api as ProviderApi) : "openai-completions";
@@ -621,13 +763,24 @@ export class ModelManager implements Component, Focusable {
     }
     if (data === "d") {
       if (!row) return;
-      if (!row.inConfig) {
-        this.refresh(`${row.id} 来自 Pi 内置目录，没有可删除的配置`, "warning");
+      if (row.inConfig) {
+        const doc = structuredClone(this.loaded.doc);
+        const provider = ensureProvider(doc, screen.providerId);
+        removeModel(provider, row.id);
+        // An override left behind by the deleted model would be dead config.
+        removeModelOverride(provider, row.id);
+        pruneEmptyProvider(doc, screen.providerId);
+        void this.commit(doc, `已删除模型 ${row.id}`);
         return;
       }
-      const doc = structuredClone(this.loaded.doc);
-      removeModel(ensureProvider(doc, screen.providerId), row.id);
-      void this.commit(doc, `已删除模型 ${row.id}`);
+      if (row.hasOverride) {
+        const doc = structuredClone(this.loaded.doc);
+        removeModelOverride(ensureProvider(doc, screen.providerId), row.id);
+        pruneEmptyProvider(doc, screen.providerId);
+        void this.commit(doc, `已删除 ${row.id} 的覆盖配置`);
+        return;
+      }
+      this.refresh(`${row.id} 来自 Pi 内置目录，没有可删除的配置（按 e 可以给它写一条覆盖）`, "warning");
     }
   }
 
@@ -743,7 +896,7 @@ export class ModelManager implements Component, Focusable {
   // --- field definitions --------------------------------------------------------
 
   private textField(label: string, current: string, secret: boolean, commit: (value: string) => void): void {
-    this.editing = { label, buffer: secret ? "" : current, secret, commit };
+    this.editing = { label, buffer: secret ? "" : current, secret, fresh: !secret && current.length > 0, commit };
     this.refresh();
   }
 
@@ -814,7 +967,7 @@ export class ModelManager implements Component, Focusable {
     };
     return [
       {
-        label: "模型 ID",
+        label: screen.target === "override" ? "模型 ID（内置）" : "模型 ID",
         value: draft.id || "(必填)",
         edit: screen.isNew ? () => this.textField("模型 ID", draft.id, false, (value) => write({ id: value.trim() })) : undefined,
       },
@@ -856,7 +1009,10 @@ export class ModelManager implements Component, Focusable {
     if (this.editing) {
       const marker = this._focused ? CURSOR_MARKER : "";
       const shown = this.editing.secret ? "•".repeat(this.editing.buffer.length) : this.editing.buffer;
-      return { text: `${this.editing.label}: ${shown}${marker}▌   Enter 确认   Esc 取消`, tone: "dim" };
+      // The hint has to state the replace rule, or the first keystroke looks
+      // like it appended and then erased the old value.
+      const keys = this.editing.fresh ? "输入即替换   Backspace 逐字删   Enter 确认   Esc 取消" : "Enter 确认   Esc 取消";
+      return { text: `${this.editing.label}: ${shown}${marker}▌   ${keys}`, tone: "dim" };
     }
     if (this.status) return { text: this.status.text, tone: this.status.tone };
     return { text: actions, tone: "dim" };
@@ -895,7 +1051,7 @@ export class ModelManager implements Component, Focusable {
       { title: "上下文", width: 7, right: true, value: (row) => compactCount(row.contextWindow) },
       { title: "输出", width: 7, right: true, value: (row) => compactCount(row.maxTokens) },
       { title: "能力", width: 12, value: (row) => describeCapabilities(row) },
-      { title: "来源", width: 6, value: (row) => (row.inConfig ? "配置" : "内置") },
+      { title: "来源", width: 6, value: (row) => ORIGIN_LABEL[row.origin] },
     ];
     const footer = this.footer(MODEL_ACTIONS);
     return frame({
@@ -916,10 +1072,25 @@ export class ModelManager implements Component, Focusable {
 
   private renderModelForm(width: number): string[] {
     const screen = this.screen as Extract<Screen, { kind: "modelForm" }>;
-    return this.renderForm(width, `模型${screen.isNew ? "" : ` ${screen.originalId}`}`, this.modelFields(screen), screen.field, screen.isNew);
+    const isOverride = screen.target === "override";
+    const label = isOverride ? "覆盖" : "模型";
+    const hint = isOverride
+      ? "写入 modelOverrides，只写你填过的字段；全部清空即删除覆盖"
+      : "留空并保存即删除该项；表单未列出的字段会原样保留";
+    const meta = [hint];
+    if (isOverride) {
+      // The form has no prefilled catalog values, so state what is in effect.
+      const effective = this.host.catalogModels(screen.providerId).find((model) => model.id === screen.originalId);
+      if (effective) {
+        meta.push(
+          `当前生效：上下文 ${compactCount(effective.contextWindow)} · 输出 ${compactCount(effective.maxTokens)} · 思考 ${effective.reasoning ? "开" : "关"} · 图片 ${effective.image ? "开" : "关"}`,
+        );
+      }
+    }
+    return this.renderForm(width, `${label}${screen.isNew ? "" : ` ${screen.originalId}`}`, this.modelFields(screen), screen.field, screen.isNew, meta);
   }
 
-  private renderForm(width: number, what: string, fields: FormField[], selected: number, isNew: boolean): string[] {
+  private renderForm(width: number, what: string, fields: FormField[], selected: number, isNew: boolean, meta?: string[]): string[] {
     const columns: Column<FormField>[] = [
       { title: "字段", width: 13, value: (row) => row.label },
       { title: "", width: "flex", value: (row) => row.value },
@@ -929,7 +1100,7 @@ export class ModelManager implements Component, Focusable {
       theme: this.theme,
       width,
       title: `${isNew ? "新建" : "编辑"}${what}`,
-      meta: this.editing ? [] : ["留空并保存即删除该项；表单未列出的字段会原样保留"],
+      meta: this.editing ? [] : (meta ?? ["留空并保存即删除该项；表单未列出的字段会原样保留"]),
       body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "" }),
       footer: footer.text,
       footerTone: footer.tone,

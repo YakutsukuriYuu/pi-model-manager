@@ -238,3 +238,48 @@ export function removeModel(provider: ProviderEntry, id: string): void {
   provider.models = provider.models.filter((entry) => !(isRecord(entry) && entry.id === id));
   if (provider.models.length === 0) delete provider.models;
 }
+
+/**
+ * Per-model overrides, which Pi applies on top of its built-in catalog.
+ *
+ * This is the only way to change a model Pi ships: its catalog is generated
+ * metadata, so the edit has to live in models.json as an override rather than
+ * as a replacement entry. Pi merges it field-by-field over the catalog model.
+ * The model id is the key, so an override body carries no `id` of its own.
+ */
+export type ModelOverrideEntry = Record<string, unknown>;
+
+export function modelOverridesOf(provider: ProviderEntry | undefined): Record<string, ModelOverrideEntry> {
+  const overrides = provider?.modelOverrides;
+  return isRecord(overrides) ? (overrides as Record<string, ModelOverrideEntry>) : {};
+}
+
+export function ensureModelOverrides(provider: ProviderEntry): Record<string, ModelOverrideEntry> {
+  if (!isRecord(provider.modelOverrides)) provider.modelOverrides = {};
+  return provider.modelOverrides as Record<string, ModelOverrideEntry>;
+}
+
+export function findModelOverride(provider: ProviderEntry | undefined, id: string): ModelOverrideEntry | undefined {
+  return modelOverridesOf(provider)[id];
+}
+
+/** Drops the whole `modelOverrides` key once the last override is gone. */
+export function removeModelOverride(provider: ProviderEntry, id: string): void {
+  const overrides = modelOverridesOf(provider);
+  if (!(id in overrides)) return;
+  delete overrides[id];
+  if (Object.keys(overrides).length === 0) delete provider.modelOverrides;
+}
+
+/**
+ * Removes a provider entry that configures nothing.
+ *
+ * Pi rejects an entry with no `models`, `baseUrl`, `headers`, `compat`,
+ * `modelOverrides`, `apiKey`, `oauth`, or `authHeader` as
+ * "must specify ...", so clearing the last override would otherwise make the
+ * whole save fail and roll back.
+ */
+export function pruneEmptyProvider(doc: ModelsDocument, id: string): void {
+  const entry = getProvider(doc, id);
+  if (entry && Object.keys(entry).length === 0) removeProvider(doc, id);
+}
