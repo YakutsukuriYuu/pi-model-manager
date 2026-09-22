@@ -1,6 +1,15 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, type Component, type Focusable, type TUI, Key, matchesKey } from "@earendil-works/pi-tui";
-import { SUPPORTED_APIS, type DiscoveredModel, type ProviderApi } from "../discovery.ts";
+import {
+  SUPPORTED_APIS,
+  applyCatalogMetadata,
+  compareWithExisting,
+  type CatalogModel,
+  type DiscoveredModel,
+  type ExistingState,
+  type FieldSource,
+  type ProviderApi,
+} from "../discovery.ts";
 import {
   type LoadedModels,
   type ModelEntry,
@@ -17,15 +26,8 @@ import {
 } from "../models-json.ts";
 import { type Column, type ThemeLike, compactCount, frame, safeTheme, table } from "./frame.ts";
 
-/** A model as Pi currently resolves it, including built-in catalog entries. */
-export interface CatalogModel {
-  id: string;
-  name?: string;
-  contextWindow?: number;
-  maxTokens?: number;
-  reasoning?: boolean;
-  image?: boolean;
-}
+/** Re-exported so the extension entry point can build the catalog index. */
+export type { CatalogModel };
 
 export interface ModelRow extends CatalogModel {
   /** Present in models.json, so editable and deletable. */
@@ -73,6 +75,12 @@ export interface ManagerHost {
   /** Every provider id Pi knows about, built-ins included. */
   catalogProviderIds(): string[];
   catalogModels(providerId: string): CatalogModel[];
+  /**
+   * Pi's catalog keyed by model id, used to fill fields an upstream omits.
+   * Providers already defined in models.json are excluded so the user's own
+   * (possibly stale) values can never be fed back as if they were a reference.
+   */
+  catalogMetadata(): Map<string, CatalogModel>;
   /** Configured values used to prefill a provider that has no config yet. */
   providerDefaults(providerId: string): { name?: string; baseUrl?: string; api?: string };
   fetchModels(providerId: string, baseUrl: string, api: ProviderApi): Promise<DiscoveredModel[]>;
@@ -96,17 +104,23 @@ interface Editing {
   commit(value: string): void;
 }
 
+/** One discovery result plus how it relates to the configured entry. */
+interface FetchRow {
+  model: DiscoveredModel;
+  state: ExistingState;
+}
+
 type Screen =
   | { kind: "providers"; index: number }
   | { kind: "models"; providerId: string; index: number }
   | { kind: "providerForm"; providerId: string; isNew: boolean; draft: ProviderDraft; field: number }
   | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; draft: ModelDraft; field: number }
-  | { kind: "fetch"; providerId: string; discovered: DiscoveredModel[]; checked: Set<string>; index: number };
+  | { kind: "fetch"; providerId: string; rows: FetchRow[]; checked: Set<string>; index: number };
 
 const PROVIDER_ACTIONS = "↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
 const MODEL_ACTIONS = "↑↓ 选择   Enter 使用   e 编辑接入   a 添加模型   f 获取模型   d 删除   Esc 返回";
 const FORM_ACTIONS = "↑↓ 选择字段   Enter 编辑   ←→ 切换   Ctrl+S 保存   Esc 取消";
-const FETCH_ACTIONS = "↑↓ 移动   Space 勾选   a 全选/全不选   Enter 保存   Esc 取消";
+const FETCH_ACTIONS = "↑↓ 移动   Space 勾选   u 勾选值不同的   a 全选/全不选   Enter 保存   Esc 取消";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -262,10 +276,25 @@ export function redactSecret(value: string): string {
   return `${value.slice(0, 4)}…${value.slice(-3)}`;
 }
 
-export function describeCapabilities(model: { reasoning?: boolean; image?: boolean; inferredReasoning?: boolean; inferredImage?: boolean }): string {
+const STATUS_LABEL: Record<ExistingState, string> = { new: "新增", differs: "不同", same: "已存在" };
+
+const SOURCE_MARK: Record<FieldSource, string> = { upstream: "", catalog: "*", guess: "?" };
+
+/**
+ * Appends the provenance marker to a displayed value, so where a number came
+ * from is visible right where it is read rather than only in a legend.
+ */
+export function markValue(value: string, source: FieldSource | undefined): string {
+  return source === undefined ? value : `${value}${SOURCE_MARK[source]}`;
+}
+
+export function describeCapabilities(
+  model: { reasoning?: boolean; image?: boolean },
+  sources?: DiscoveredModel["sources"],
+): string {
   const parts: string[] = [];
-  if (model.reasoning) parts.push(model.inferredReasoning ? "思考?" : "思考");
-  if (model.image) parts.push(model.inferredImage ? "图片?" : "图片");
+  if (model.reasoning) parts.push(markValue("思考", sources?.reasoning));
+  if (model.image) parts.push(markValue("图片", sources?.image));
   return parts.join(" ") || "文本";
 }
 
@@ -377,15 +406,17 @@ export class ModelManager implements Component, Focusable {
   }
 
   private async saveFetched(screen: Extract<Screen, { kind: "fetch" }>): Promise<void> {
-    const chosen = screen.discovered.filter((model) => screen.checked.has(model.id));
+    const chosen = screen.rows.filter((row) => screen.checked.has(row.model.id));
     if (chosen.length === 0) {
       this.refresh("没有勾选任何模型", "warning");
       return;
     }
     const doc = structuredClone(this.loaded.doc);
     const provider = ensureProvider(doc, screen.providerId);
-    for (const model of chosen) upsertModel(provider, toEntry(model));
-    if (await this.commit(doc, `已写入 ${chosen.length} 个模型`)) {
+    for (const row of chosen) upsertModel(provider, toEntry(row.model));
+    const updated = chosen.filter((row) => row.state === "differs").length;
+    const added = chosen.length - updated;
+    if (await this.commit(doc, `已新增 ${added} 个模型${updated > 0 ? `，更新 ${updated} 个` : ""}`)) {
       this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
     }
   }
@@ -394,15 +425,22 @@ export class ModelManager implements Component, Focusable {
     this.busy = true;
     this.refresh("正在从上游获取模型…");
     try {
-      const discovered = await this.host.fetchModels(providerId, baseUrl, api);
-      const configured = new Set(modelEntries(this.providerEntry(providerId)).map((entry) => entry.id));
-      const checked = new Set(discovered.filter((model) => !configured.has(model.id)).map((model) => model.id));
-      this.screen = { kind: "fetch", providerId, discovered, checked, index: 0 };
+      // Pi's catalog only fills what the upstream left blank.
+      const discovered = applyCatalogMetadata(await this.host.fetchModels(providerId, baseUrl, api), this.host.catalogMetadata());
+      const rows: FetchRow[] = discovered.map((model) => ({
+        model,
+        state: compareWithExisting(findModel(this.providerEntry(providerId), model.id), model),
+      }));
+      // Only genuinely new models start selected; updating an existing entry
+      // changes context window and therefore cost, so it stays opt-in.
+      const checked = new Set(rows.filter((row) => row.state === "new").map((row) => row.model.id));
+      this.screen = { kind: "fetch", providerId, rows, checked, index: 0 };
+      const differs = rows.filter((row) => row.state === "differs").length;
       this.refresh(
-        discovered.length === 0
+        rows.length === 0
           ? "上游没有返回模型"
-          : `发现 ${discovered.length} 个，其中 ${checked.size} 个是新的${checked.size === 0 ? "" : "（已勾选）"}`,
-        discovered.length === 0 ? "warning" : "dim",
+          : `发现 ${rows.length} 个 · 新增 ${checked.size} 个（已勾选）${differs > 0 ? ` · ${differs} 个值不同（按 u 勾选更新）` : ""}`,
+        rows.length === 0 ? "warning" : "dim",
       );
     } catch (error) {
       this.refresh(`获取失败：${error instanceof Error ? error.message : String(error)}`, "error");
@@ -667,24 +705,36 @@ export class ModelManager implements Component, Focusable {
     }
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       const delta = matchesKey(data, Key.up) ? -1 : 1;
-      this.screen = { ...screen, index: this.move(screen.index, delta, screen.discovered.length) };
+      this.screen = { ...screen, index: this.move(screen.index, delta, screen.rows.length) };
       this.refresh();
       return;
     }
-    const model = screen.discovered[screen.index];
+    const row = screen.rows[screen.index];
     if (matchesKey(data, Key.space)) {
-      if (!model) return;
+      if (!row) return;
       const checked = new Set(screen.checked);
-      if (checked.has(model.id)) checked.delete(model.id);
-      else checked.add(model.id);
+      if (checked.has(row.model.id)) checked.delete(row.model.id);
+      else checked.add(row.model.id);
       this.screen = { ...screen, checked };
       this.refresh();
       return;
     }
     if (data === "a") {
-      const allChecked = screen.checked.size === screen.discovered.length && screen.discovered.length > 0;
-      this.screen = { ...screen, checked: allChecked ? new Set() : new Set(screen.discovered.map((entry) => entry.id)) };
+      const allChecked = screen.checked.size === screen.rows.length && screen.rows.length > 0;
+      this.screen = { ...screen, checked: allChecked ? new Set() : new Set(screen.rows.map((entry) => entry.model.id)) };
       this.refresh();
+      return;
+    }
+    if (data === "u") {
+      // Opt in to rewriting entries whose values differ from upstream. This is
+      // separate from "a" because it changes context windows and thus cost.
+      const changed = screen.rows.filter((entry) => entry.state !== "same").map((entry) => entry.model.id);
+      if (changed.length === 0) {
+        this.refresh("没有值不同的模型", "warning");
+        return;
+      }
+      this.screen = { ...screen, checked: new Set(changed) };
+      this.refresh(`已勾选 ${changed.length} 个新增或值不同的模型`);
       return;
     }
     if (matchesKey(data, Key.enter)) void this.saveFetched(screen);
@@ -888,21 +938,32 @@ export class ModelManager implements Component, Focusable {
 
   private renderFetch(width: number): string[] {
     const screen = this.screen as Extract<Screen, { kind: "fetch" }>;
-    const rows = screen.discovered;
-    const columns: Column<DiscoveredModel>[] = [
-      { title: "", width: 3, value: (row) => (screen.checked.has(row.id) ? "[x]" : "[ ]") },
-      { title: "模型", width: "flex", value: (row) => row.id },
-      { title: "上下文", width: 7, right: true, value: (row) => compactCount(row.contextWindow) },
-      { title: "输出", width: 7, right: true, value: (row) => compactCount(row.maxTokens) },
-      { title: "识别到", width: 12, value: (row) => describeCapabilities(row) },
+    const rows = screen.rows;
+    const columns: Column<FetchRow>[] = [
+      { title: "", width: 3, value: (row) => (screen.checked.has(row.model.id) ? "[x]" : "[ ]") },
+      { title: "模型", width: "flex", value: (row) => row.model.id },
+      { title: "上下文", width: 8, right: true, value: (row) => markValue(compactCount(row.model.contextWindow), row.model.sources.contextWindow) },
+      { title: "输出", width: 8, right: true, value: (row) => markValue(compactCount(row.model.maxTokens), row.model.sources.maxTokens) },
+      { title: "能力", width: 13, value: (row) => describeCapabilities(row.model, row.model.sources) },
+      { title: "状态", width: 6, value: (row) => STATUS_LABEL[row.state] },
     ];
     const footer = this.footer(FETCH_ACTIONS);
     return frame({
       theme: this.theme,
       width,
       title: `从上游获取模型 · ${screen.providerId}`,
-      meta: [`已勾选 ${screen.checked.size} / ${rows.length}`, "已有模型不会被改写，只新增勾选项"],
-      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "上游没有返回任何模型" }),
+      meta: [
+        `已勾选 ${screen.checked.size} / ${rows.length} · 新增项默认已勾选，值不同的需按 u 勾选才会改写`,
+        "* 来自 Pi 内置目录（上游未提供）   ? 按模型名推断",
+      ],
+      body: table({
+        theme: this.theme,
+        width,
+        columns,
+        rows,
+        selected: Math.min(screen.index, Math.max(0, rows.length - 1)),
+        empty: "上游没有返回任何模型",
+      }),
       footer: footer.text,
       footerTone: footer.tone,
     });

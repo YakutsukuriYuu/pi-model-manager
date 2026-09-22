@@ -3,9 +3,14 @@ import type { ModelEntry } from "./models-json.ts";
 /**
  * Model discovery for a configured provider.
  *
- * Only fields the upstream actually reported are written back, so an entry
- * never carries a guessed number. Pi applies its own defaults for anything
- * absent, and the user can edit anything afterwards.
+ * Values come from three sources, in this order of trust:
+ *
+ * 1. `upstream` — what the provider's own model list actually reported.
+ * 2. `catalog`  — Pi's built-in catalog, used only to fill fields the upstream
+ *    stayed silent about. It describes the vendor's native model, which a
+ *    gateway may cap lower, so it never overrides a reported value.
+ * 3. `guess`    — a capability inferred from the model id. Always surfaced as
+ *    a guess in the UI because it is not a claim from anyone.
  */
 
 export const SUPPORTED_APIS = [
@@ -17,6 +22,29 @@ export const SUPPORTED_APIS = [
 
 export type ProviderApi = (typeof SUPPORTED_APIS)[number];
 
+/** A model as Pi currently knows it, including built-in catalog entries. */
+export interface CatalogModel {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  image?: boolean;
+}
+
+export type FieldSource = "upstream" | "catalog" | "guess";
+
+export interface DiscoveredModel {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  image?: boolean;
+  /** Provenance per field; an absent entry means "not determined". */
+  sources: Partial<Record<"name" | "contextWindow" | "maxTokens" | "reasoning" | "image", FieldSource>>;
+}
+
 export interface DiscoveryTarget {
   baseUrl: string;
   api: ProviderApi;
@@ -24,18 +52,7 @@ export interface DiscoveryTarget {
   headers?: Record<string, string>;
 }
 
-export interface DiscoveredModel {
-  id: string;
-  /** Upstream display name, when it differs from the id. */
-  name?: string;
-  contextWindow?: number;
-  maxTokens?: number;
-  reasoning?: boolean;
-  image?: boolean;
-  /** True when a capability came from the id pattern rather than the payload. */
-  inferredReasoning?: boolean;
-  inferredImage?: boolean;
-}
+export type ExistingState = "new" | "same" | "differs";
 
 const ANTHROPIC_VERSION = "2023-06-01";
 
@@ -121,6 +138,13 @@ function rawId(record: Record<string, unknown>): string | undefined {
   return value.startsWith("models/") ? value.slice("models/".length) : value;
 }
 
+/**
+ * Field names real provider lists use for the context window and output cap,
+ * including the OpenRouter-style nesting under `top_provider`.
+ */
+const CONTEXT_KEYS = ["contextWindow", "context_window", "context_length", "inputTokenLimit", "input_token_limit", "max_context_length"];
+const OUTPUT_KEYS = ["maxTokens", "max_tokens", "outputTokenLimit", "output_token_limit", "max_output_tokens"];
+
 /** Tokens that unambiguously mark a capability in a model id. */
 const REASONING_ID = /(?:^|[-_/])(?:reasoning|thinking|r1)(?:$|[-_/])/iu;
 const IMAGE_ID = /(?:^|[-_/])(?:vision|image|multimodal)(?:$|[-_/])/iu;
@@ -143,37 +167,89 @@ export function parseModels(payload: unknown): DiscoveredModel[] {
     if (!id || seen.has(id)) continue;
     seen.add(id);
 
-    const modalities = declaredModalities(item);
-    const declaredReasoning = item.reasoning === true || item.supports_reasoning === true
-      || stringList(item.supported_parameters).includes("reasoning");
-    const declaredImage = modalities.some((entry) => /image|vision/iu.test(entry));
-    const model: DiscoveredModel = { id };
+    const model: DiscoveredModel = { id, sources: {} };
 
+    // Some gateways echo the id as `name`; that is not a display name.
     const name = displayName(item);
-    if (name && name !== id) model.name = name.startsWith("models/") ? name.slice("models/".length) : name;
-
-    // OpenRouter-style catalogs put the window at the top level and the output
-    // cap under `top_provider`.
-    const context = positiveNumber(item, ["contextWindow", "context_window", "context_length", "inputTokenLimit", "input_token_limit"]);
-    if (context !== undefined) model.contextWindow = context;
-    const output = positiveNumber(item, ["maxTokens", "max_tokens", "outputTokenLimit", "output_token_limit"])
-      ?? nestedPositiveNumber(item, "top_provider", ["max_completion_tokens", "max_tokens"]);
-    if (output !== undefined) model.maxTokens = output;
-
-    if (declaredReasoning) model.reasoning = true;
-    else if (REASONING_ID.test(id)) {
-      model.reasoning = true;
-      model.inferredReasoning = true;
+    if (name && name !== id) {
+      model.name = name.startsWith("models/") ? name.slice("models/".length) : name;
+      model.sources.name = "upstream";
     }
-    if (declaredImage) model.image = true;
-    else if (IMAGE_ID.test(id)) {
+
+    const context = positiveNumber(item, CONTEXT_KEYS);
+    if (context !== undefined) {
+      model.contextWindow = context;
+      model.sources.contextWindow = "upstream";
+    }
+    const output = positiveNumber(item, OUTPUT_KEYS)
+      ?? nestedPositiveNumber(item, "top_provider", ["max_completion_tokens", "max_tokens"]);
+    if (output !== undefined) {
+      model.maxTokens = output;
+      model.sources.maxTokens = "upstream";
+    }
+
+    const declaredReasoning = item.reasoning === true
+      || item.supports_reasoning === true
+      || stringList(item.supported_parameters).includes("reasoning");
+    const declaredImage = declaredModalities(item).some((entry) => /image|vision/iu.test(entry));
+    if (declaredReasoning) {
+      model.reasoning = true;
+      model.sources.reasoning = "upstream";
+    } else if (REASONING_ID.test(id)) {
+      model.reasoning = true;
+      model.sources.reasoning = "guess";
+    }
+    if (declaredImage) {
       model.image = true;
-      model.inferredImage = true;
+      model.sources.image = "upstream";
+    } else if (IMAGE_ID.test(id)) {
+      model.image = true;
+      model.sources.image = "guess";
     }
 
     models.push(model);
   }
   return models.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+/**
+ * Fills fields the upstream did not report from Pi's built-in catalog.
+ *
+ * Only missing values are taken. Overwriting would replace what a gateway
+ * explicitly declared with the vendor's native maximum, and context window is
+ * not cosmetic: it drives compaction thresholds and pricing tiers.
+ */
+export function applyCatalogMetadata(
+  models: readonly DiscoveredModel[],
+  catalog: ReadonlyMap<string, CatalogModel>,
+): DiscoveredModel[] {
+  return models.map((model) => {
+    const known = catalog.get(model.id);
+    if (!known) return model;
+    const filled: DiscoveredModel = { ...model, sources: { ...model.sources } };
+
+    if (filled.name === undefined && known.name) {
+      filled.name = known.name;
+      filled.sources.name = "catalog";
+    }
+    if (filled.contextWindow === undefined && known.contextWindow !== undefined) {
+      filled.contextWindow = known.contextWindow;
+      filled.sources.contextWindow = "catalog";
+    }
+    if (filled.maxTokens === undefined && known.maxTokens !== undefined) {
+      filled.maxTokens = known.maxTokens;
+      filled.sources.maxTokens = "catalog";
+    }
+    if (filled.reasoning === undefined && known.reasoning !== undefined) {
+      filled.reasoning = known.reasoning;
+      filled.sources.reasoning = "catalog";
+    }
+    if (filled.image === undefined && known.image !== undefined) {
+      filled.image = known.image;
+      filled.sources.image = "catalog";
+    }
+    return filled;
+  });
 }
 
 export async function fetchModels(target: DiscoveryTarget, signal: AbortSignal): Promise<DiscoveredModel[]> {
@@ -198,10 +274,31 @@ export function partitionDiscovered(
   };
 }
 
+function sameInput(existing: ModelEntry, model: DiscoveredModel): boolean | undefined {
+  if (!Array.isArray(existing.input)) return model.image === undefined ? undefined : model.image === false;
+  return existing.input.includes("image") === (model.image === true);
+}
+
+/**
+ * Classifies a discovered model against its configured entry.
+ *
+ * Only fields that would actually be written are compared, so a re-fetch does
+ * not report a difference for metadata it never touches.
+ */
+export function compareWithExisting(existing: ModelEntry | undefined, model: DiscoveredModel): ExistingState {
+  if (!existing) return "new";
+  const differs =
+    (model.name !== undefined && (existing.name ?? undefined) !== model.name)
+    || (model.contextWindow !== undefined && existing.contextWindow !== model.contextWindow)
+    || (model.maxTokens !== undefined && existing.maxTokens !== model.maxTokens)
+    || (model.reasoning !== undefined && (existing.reasoning === true) !== model.reasoning)
+    || sameInput(existing, model) === false;
+  return differs ? "differs" : "same";
+}
+
 /**
  * Builds the stored entry. Absent fields are omitted rather than filled with
- * defaults, so a rewrite never invents a context window the upstream never
- * reported.
+ * defaults, so a rewrite never invents a context window nobody reported.
  */
 export function toModelEntry(model: DiscoveredModel): ModelEntry {
   const entry: ModelEntry = { id: model.id };

@@ -34,6 +34,8 @@ function harness(
   initial: ModelsDocument,
   options: {
     catalog?: Record<string, CatalogModel[]>;
+    /** Pi's catalog used to fill blank fields, keyed by model id. */
+    metadata?: Map<string, CatalogModel>;
     discovered?: DiscoveredModel[];
     saveOk?: boolean;
     saveError?: string;
@@ -52,6 +54,7 @@ function harness(
     },
     catalogProviderIds: () => Object.keys(options.catalog ?? {}),
     catalogModels: (providerId) => options.catalog?.[providerId] ?? [],
+    catalogMetadata: () => options.metadata ?? new Map(),
     providerDefaults: (providerId) => ({ api: options.catalog?.[providerId] ? "openai-completions" : undefined }),
     fetchModels: async () => options.discovered ?? [],
     currentModelId: () => undefined,
@@ -63,6 +66,11 @@ function harness(
   };
   const manager = new ModelManager({ requestRender: () => {} } as never, fakeTheme(), host.load(), host);
   return { manager, saved, doc: () => doc, closed: () => isClosed };
+}
+
+/** Discovery results in tests carry no provenance unless stated. */
+function dm(id: string, extra: Omit<Partial<DiscoveredModel>, "id"> = {}): DiscoveredModel {
+  return { id, sources: {}, ...extra };
 }
 
 /** Async actions are started with `void`, so let the microtask queue drain. */
@@ -100,7 +108,7 @@ const PROVIDER_DOC: ModelsDocument = {
 test("renders every screen within the terminal width", async () => {
   const h = harness(PROVIDER_DOC, {
     catalog: { builtin: [{ id: "builtin-model", contextWindow: 500 }] },
-    discovered: [{ id: "new-model", contextWindow: 2000 }],
+    discovered: [dm("new-model", { contextWindow: 2000 })],
   });
 
   assertRenders(h.manager, "providers");
@@ -124,7 +132,7 @@ test("renders every screen within the terminal width", async () => {
 });
 
 test("creates a provider with only a base URL and an API key", async () => {
-  const h = harness({}, { discovered: [{ id: "auto-1" }, { id: "auto-2" }] });
+  const h = harness({}, { discovered: [dm("auto-1"), dm("auto-2")] });
 
   h.manager.handleInput("n");
   h.manager.handleInput(KEY.enter);
@@ -157,9 +165,9 @@ test("creates a provider with only a base URL and an API key", async () => {
 
 test("fetches models and adds only the newly discovered ones", async () => {
   const discovered: DiscoveredModel[] = [
-    { id: "demo-model", contextWindow: 999 }, // already configured
-    { id: "fresh-a", contextWindow: 5000, maxTokens: 1000, reasoning: true, inferredReasoning: true },
-    { id: "fresh-b" },
+    dm("demo-model", { contextWindow: 999 }), // already configured with a different value
+    dm("fresh-a", { contextWindow: 5000, maxTokens: 1000, reasoning: true, sources: { reasoning: "guess" } }),
+    dm("fresh-b"),
   ];
   const h = harness(PROVIDER_DOC, { discovered });
 
@@ -184,7 +192,7 @@ test("fetches models and adds only the newly discovered ones", async () => {
 });
 
 test("space deselects a model before saving", async () => {
-  const h = harness(PROVIDER_DOC, { discovered: [{ id: "fresh-a" }, { id: "fresh-b" }] });
+  const h = harness(PROVIDER_DOC, { discovered: [dm("fresh-a"), dm("fresh-b")] });
   h.manager.handleInput(KEY.enter);
   h.manager.handleInput("f");
   await tick();
@@ -193,6 +201,51 @@ test("space deselects a model before saving", async () => {
   await tick();
 
   assert.deepEqual(h.saved.at(-1)?.providers?.demo.models?.map((model) => model.id), ["demo-model", "fresh-b"]);
+});
+
+test("u opts in to rewriting entries whose values differ", async () => {
+  const h = harness(PROVIDER_DOC, {
+    discovered: [dm("demo-model", { contextWindow: 999 }), dm("same-model"), dm("fresh-a")],
+  });
+  // `same-model` is not configured, so add it first to make it an existing entry.
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("f");
+  await tick();
+
+  // Before pressing u only new models are selected.
+  const shown = h.manager.render(120).join("\n");
+  assert.match(shown, /新增/);
+  assert.match(shown, /不同/);
+
+  h.manager.handleInput("u");
+  h.manager.handleInput(KEY.enter);
+  await tick();
+
+  const models = h.saved.at(-1)?.providers?.demo.models ?? [];
+  assert.equal(models.find((model) => model.id === "demo-model")?.contextWindow, 999, "u rewrites the differing entry");
+  assert.equal(models.find((model) => model.id === "fresh-a")?.id, "fresh-a");
+});
+
+test("values taken from Pi's catalog are marked as such", async () => {
+  const h = harness(PROVIDER_DOC, {
+    // Upstream reports nothing for this model except its id.
+    discovered: [dm("catalog-known")],
+    metadata: new Map([["catalog-known", { id: "catalog-known", contextWindow: 1_000_000, maxTokens: 64_000, reasoning: true }]]),
+  });
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("f");
+  await tick();
+
+  const shown = h.manager.render(140).join("\n");
+  assert.match(shown, /1M\*/, "a catalog-sourced context window is marked");
+  assert.match(shown, /64k\*/);
+
+  h.manager.handleInput(KEY.enter);
+  await tick();
+  const written = h.saved.at(-1)?.providers?.demo.models?.find((model) => model.id === "catalog-known");
+  assert.equal(written?.contextWindow, 1_000_000);
+  assert.equal(written?.maxTokens, 64_000);
+  assert.equal(written?.reasoning, true);
 });
 
 test("refuses to save while a field is invalid and reports why", async () => {

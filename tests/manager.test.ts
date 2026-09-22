@@ -9,6 +9,7 @@ import {
   describeCapabilities,
   draftFromModel,
   draftFromProvider,
+  markValue,
   parseHeaders,
   redactSecret,
   validateModelDraft,
@@ -172,10 +173,18 @@ test("secret display never reveals a literal key", () => {
   assert.equal(redactSecret("short"), "•••••");
 });
 
-test("capability labels mark inferred values", () => {
+test("capability and value labels carry their provenance", () => {
   assert.equal(describeCapabilities({}), "文本");
   assert.equal(describeCapabilities({ reasoning: true }), "思考");
-  assert.equal(describeCapabilities({ reasoning: true, inferredReasoning: true }), "思考?");
   assert.equal(describeCapabilities({ reasoning: true, image: true }), "思考 图片");
-  assert.equal(describeCapabilities({ image: true, inferredImage: true }), "图片?");
+  // upstream is unmarked; catalog and guesses are flagged.
+  assert.equal(describeCapabilities({ reasoning: true }, { reasoning: "upstream" }), "思考");
+  assert.equal(describeCapabilities({ reasoning: true }, { reasoning: "catalog" }), "思考*");
+  assert.equal(describeCapabilities({ reasoning: true }, { reasoning: "guess" }), "思考?");
+  assert.equal(describeCapabilities({ image: true }, { image: "guess" }), "图片?");
+
+  assert.equal(markValue("1M", undefined), "1M");
+  assert.equal(markValue("1M", "upstream"), "1M");
+  assert.equal(markValue("1M", "catalog"), "1M*");
+  assert.equal(markValue("—", undefined), "—", "an unknown value keeps its placeholder");
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
-import { fetchModels, modelsUrl, parseModels, partitionDiscovered, toModelEntry } from "../src/discovery.ts";
+import { fetchModels, modelsUrl, parseModels, partitionDiscovered, applyCatalogMetadata, compareWithExisting, toModelEntry, type DiscoveredModel } from "../src/discovery.ts";
 
 async function withServer(
   handler: (url: string, headers: http.IncomingHttpHeaders) => { status: number; body: unknown },
@@ -66,7 +66,8 @@ test("parseModels reads OpenAI, Anthropic, Google, and OpenRouter shapes", () =>
   assert.equal(openrouter[0].maxTokens, 32_000);
   assert.equal(openrouter[0].image, true);
   assert.equal(openrouter[0].reasoning, true);
-  assert.equal(openrouter[0].inferredReasoning, undefined, "declared reasoning is not an inference");
+  assert.equal(openrouter[0].sources.reasoning, "upstream", "declared reasoning is not an inference")
+  assert.equal(openrouter[0].sources.image, "upstream");
 
   // Unknown shapes must not throw.
   assert.deepEqual(parseModels({ nope: true }), []);
@@ -74,20 +75,65 @@ test("parseModels reads OpenAI, Anthropic, Google, and OpenRouter shapes", () =>
   assert.equal(parseModels({ data: [{ id: "a" }, { id: "a" }, { noId: 1 }] }).length, 1);
 });
 
-test("capability inference only fires on unambiguous id markers and is flagged", () => {
+test("capability inference only fires on unambiguous id markers and is flagged as a guess", () => {
   const [reasoning] = parseModels({ data: [{ id: "deepseek-reasoning-r1" }] });
   assert.equal(reasoning.reasoning, true);
-  assert.equal(reasoning.inferredReasoning, true);
-  assert.equal(reasoning.inferredImage, undefined);
+  assert.equal(reasoning.sources.reasoning, "guess");
+  assert.equal(reasoning.sources.image, undefined);
 
   const [vision] = parseModels({ data: [{ id: "acme-vision-pro" }] });
   assert.equal(vision.image, true);
-  assert.equal(vision.inferredImage, true);
+  assert.equal(vision.sources.image, "guess");
 
   // Substring matches must not fire: "advisable" contains "vis".
   const [plain] = parseModels({ data: [{ id: "vendor/advisable-model" }] });
   assert.equal(plain.image, undefined);
   assert.equal(plain.reasoning, undefined);
+});
+
+test("applyCatalogMetadata fills only what the upstream left blank", () => {
+  const upstream = parseModels({
+    data: [
+      { id: "gateway-capped", context_length: 200_000 },
+      { id: "silent" },
+      { id: "unknown-everywhere" },
+    ],
+  });
+  const catalog = new Map([
+    ["gateway-capped", { id: "gateway-capped", contextWindow: 1_000_000, maxTokens: 999, reasoning: true }],
+    ["silent", { id: "silent", contextWindow: 500_000, maxTokens: 32_000, image: true }],
+  ]);
+  const [capped, silent, unknown] = applyCatalogMetadata(upstream, catalog);
+
+  // A reported value is never replaced by the vendor's native maximum: the
+  // gateway may cap lower, and context window drives cost and compaction.
+  assert.equal(capped.contextWindow, 200_000);
+  assert.equal(capped.sources.contextWindow, "upstream");
+  assert.equal(capped.maxTokens, 999, "a blank field is still filled");
+  assert.equal(capped.sources.maxTokens, "catalog");
+  assert.equal(capped.reasoning, true);
+
+  assert.equal(silent.contextWindow, 500_000);
+  assert.equal(silent.sources.contextWindow, "catalog");
+  assert.equal(silent.image, true);
+  assert.equal(silent.sources.image, "catalog");
+
+  assert.equal(unknown.contextWindow, undefined, "nothing is invented for an unknown model");
+  assert.deepEqual(unknown.sources, {});
+});
+
+test("compareWithExisting classifies new, same, and differing entries", () => {
+  const model = (extra: Partial<DiscoveredModel> = {}): DiscoveredModel => ({ id: "m", sources: {}, ...extra });
+
+  assert.equal(compareWithExisting(undefined, model()), "new");
+  assert.equal(compareWithExisting({ id: "m" }, model()), "same", "nothing reported means nothing differs");
+  assert.equal(compareWithExisting({ id: "m", contextWindow: 100 }, model({ contextWindow: 100 })), "same");
+  assert.equal(compareWithExisting({ id: "m", contextWindow: 100 }, model({ contextWindow: 200 })), "differs");
+  assert.equal(compareWithExisting({ id: "m", reasoning: true }, model({ reasoning: false })), "differs");
+  assert.equal(compareWithExisting({ id: "m", input: ["text"] }, model({ image: true })), "differs");
+  assert.equal(compareWithExisting({ id: "m", input: ["text", "image"] }, model({ image: true })), "same");
+  // A model with no configured input is text-only, which matches image: false.
+  assert.equal(compareWithExisting({ id: "m" }, model({ image: false })), "same");
 });
 
 test("toModelEntry writes only what upstream reported", () => {
@@ -99,7 +145,11 @@ test("toModelEntry writes only what upstream reported", () => {
 });
 
 test("partitionDiscovered separates new models from already configured ones", () => {
-  const discovered = [{ id: "a" }, { id: "b" }, { id: "c" }];
+  const discovered = [
+    { id: "a", sources: {} },
+    { id: "b", sources: {} },
+    { id: "c", sources: {} },
+  ];
   const { fresh, known } = partitionDiscovered([{ id: "b" }], discovered);
   assert.deepEqual(fresh.map((m) => m.id), ["a", "c"]);
   assert.deepEqual(known.map((m) => m.id), ["b"]);

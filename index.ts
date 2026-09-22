@@ -1,7 +1,7 @@
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type DiscoveredModel, type ProviderApi, fetchModels } from "./src/discovery.ts";
-import { type ModelsDocument, readModels, restoreModels, writeModels } from "./src/models-json.ts";
+import { type ModelsDocument, providerEntries, readModels, restoreModels, writeModels } from "./src/models-json.ts";
 import { type CatalogModel, type ManagerHost, type SaveResult, ModelManager } from "./src/ui/manager.ts";
 
 const COMMAND = "models";
@@ -64,6 +64,31 @@ function createHost(pi: ExtensionAPI, ctx: ExtensionContext, close: () => void):
           reasoning: model.reasoning,
           image: model.input.includes("image"),
         }));
+    },
+
+    /**
+     * Pi's catalog keyed by model id.
+     *
+     * Providers defined in models.json are skipped: those entries are the
+     * user's own configuration, and feeding them back as a reference would
+     * launder stale values into "Pi says so" with no new information.
+     */
+    catalogMetadata(): Map<string, CatalogModel> {
+      const configured = new Set(providerEntries(readModels().doc).map(([id]) => id));
+      const index = new Map<string, CatalogModel>();
+      for (const model of registry.getAll()) {
+        if (configured.has(model.provider)) continue;
+        if (index.has(model.id)) continue;
+        index.set(model.id, {
+          id: model.id,
+          name: model.name,
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxTokens,
+          reasoning: model.reasoning,
+          image: model.input.includes("image"),
+        });
+      }
+      return index;
     },
 
     providerDefaults(providerId: string) {
