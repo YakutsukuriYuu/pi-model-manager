@@ -99,6 +99,29 @@ pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 - `p` 编辑接入（Base URL、API Key、协议、authHeader、请求头）
 - `d` 删除该模型的配置
 
+### 所有字段都能改
+
+表单里有专门输入行的字段（模型 ID、名称、上下文、输出、思考、图片、接入的 Base URL / API Key / 协议 / authHeader / 请求头）直接改。其余字段通过**「其它字段」**这一行以 JSON 编辑：
+
+```text
+  其它字段       {"cost":{"input":3,"output":15,…},"thinkingLevelMap":{…}}
+```
+
+包括：
+
+| 层级 | 可在此设置的键 |
+| --- | --- |
+| 模型 | `cost`、`thinkingLevelMap`、`samplingParams`、`promptCache`、`headers`、`compat`、`api`、`baseUrl` |
+| 接入 | `compat`、`modelOverrides`、`oauth` 等 |
+
+规则：
+
+- 清空这一行即删除所有这些键
+- 写在这里的键会**整体替换**旧值，所以删掉某个键就是真的从文件里删掉
+- 已有专门输入行的键写在这里会被拒绝（避免两个地方改同一个值）
+- 未知键允许通过；Pi 本身允许额外键
+- 编辑长值时显示的是**尾部**（你正在输入的那一端）
+
 ## 底部两行
 
 提示信息和键位提示**分别占一行**，不会互相覆盖：

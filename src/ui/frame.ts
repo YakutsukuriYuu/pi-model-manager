@@ -178,6 +178,20 @@ export function frame(options: FrameOptions): string[] {
   return lines.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "") : line));
 }
 
+/**
+ * Keeps the end of a string.
+ *
+ * An inline editor types at the end, so when a value is longer than the line,
+ * the tail is what has to stay visible — truncating normally hides exactly the
+ * characters the user is entering.
+ */
+export function tailToWidth(text: string, width: number): string {
+  if (visibleWidth(text) <= width) return text;
+  let result = text;
+  while (result.length > 1 && visibleWidth(result) > width - 1) result = result.slice(1);
+  return `…${result}`;
+}
+
 export interface KeyHint {
   keys: string;
   label: string;

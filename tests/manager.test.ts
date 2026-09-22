@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ModelEntry, ProviderEntry } from "../src/models-json.ts";
 import {
+  MODEL_FORM_KEYS,
+  applyExtras,
   applyModelDraft,
   applyProviderDraft,
   buildModelRows,
@@ -9,7 +11,9 @@ import {
   describeCapabilities,
   draftFromModel,
   draftFromProvider,
+  extrasOf,
   markValue,
+  parseExtras,
   parseHeaders,
   redactSecret,
   validateModelDraft,
@@ -56,7 +60,7 @@ test("model rows merge config entries with Pi's catalog", () => {
 });
 
 test("provider drafts reject invalid ids and URLs", () => {
-  const base = { id: "ok", baseUrl: "https://api.example.com/v1", api: "openai-completions" as const };
+  const base = { id: "ok", baseUrl: "https://api.example.com/v1", api: "openai-completions" as const, extras: {} };
   assert.equal(validateProviderDraft(base), undefined);
   assert.match(validateProviderDraft({ ...base, id: "-bad" }) ?? "", /接入 ID/);
   assert.match(validateProviderDraft({ ...base, id: "has space" }) ?? "", /接入 ID/);
@@ -66,10 +70,10 @@ test("provider drafts reject invalid ids and URLs", () => {
 });
 
 test("model drafts reject empty ids and non-positive numbers", () => {
-  assert.equal(validateModelDraft({ id: "m" }), undefined);
-  assert.match(validateModelDraft({ id: "  " }) ?? "", /不能为空/);
-  assert.match(validateModelDraft({ id: "m", contextWindow: 0 }) ?? "", /正整数/);
-  assert.match(validateModelDraft({ id: "m", maxTokens: -1 }) ?? "", /正整数/);
+  assert.equal(validateModelDraft({ id: "m", extras: {} }), undefined);
+  assert.match(validateModelDraft({ id: "  ", extras: {} }) ?? "", /不能为空/);
+  assert.match(validateModelDraft({ id: "m", contextWindow: 0, extras: {} }) ?? "", /正整数/);
+  assert.match(validateModelDraft({ id: "m", maxTokens: -1, extras: {} }) ?? "", /正整数/);
 });
 
 test("applying a provider draft preserves fields the form does not expose", () => {
@@ -88,6 +92,7 @@ test("applying a provider draft preserves fields the form does not expose", () =
     api: "anthropic-messages",
     apiKey: "sk-literal",
     authHeader: true,
+    extras: {},
   });
 
   assert.equal(existing.baseUrl, "https://new.example.com/v1");
@@ -101,7 +106,7 @@ test("applying a provider draft preserves fields the form does not expose", () =
 
 test("clearing a provider field deletes the key instead of writing empty text", () => {
   const existing: ProviderEntry = { name: "x", apiKey: "sk-1", authHeader: true, headers: { A: "1" } };
-  applyProviderDraft(existing, { id: "p", baseUrl: "https://a.example.com", api: "openai-completions", name: "  ", apiKey: "" });
+  applyProviderDraft(existing, { id: "p", baseUrl: "https://a.example.com", api: "openai-completions", name: "  ", apiKey: "", extras: {} });
 
   assert.equal("name" in existing, false);
   assert.equal("apiKey" in existing, false);
@@ -117,7 +122,7 @@ test("applying a model draft keeps unrelated model metadata", () => {
     headers: { "X-Tier": "pro" },
     contextWindow: 1000,
   };
-  applyModelDraft(existing, { id: "m", reasoning: true, image: true, contextWindow: 2000, maxTokens: 500 });
+  applyModelDraft(existing, { id: "m", reasoning: true, image: true, contextWindow: 2000, maxTokens: 500, extras: {} });
 
   assert.equal(existing.reasoning, true);
   assert.deepEqual(existing.input, ["text", "image"]);
@@ -128,9 +133,61 @@ test("applying a model draft keeps unrelated model metadata", () => {
   assert.deepEqual(existing.headers, { "X-Tier": "pro" });
 });
 
+test("extras carry every field the form has no row for", () => {
+  const entry = {
+    id: "m",
+    name: "n",
+    contextWindow: 1000,
+    cost: { input: 1 },
+    thinkingLevelMap: { high: "high" },
+    compat: { supportsStrictTools: true },
+    samplingParams: { temperature: 1 },
+    headers: { "X-Tier": "pro" },
+    promptCache: { short: 300 },
+  };
+  assert.deepEqual(extrasOf(entry, MODEL_FORM_KEYS), {
+    cost: { input: 1 },
+    thinkingLevelMap: { high: "high" },
+    compat: { supportsStrictTools: true },
+    samplingParams: { temperature: 1 },
+    headers: { "X-Tier": "pro" },
+    promptCache: { short: 300 },
+  });
+  // Keys with their own row are not extras.
+  for (const owned of ["id", "name", "contextWindow"]) {
+    assert.equal(owned in extrasOf(entry, MODEL_FORM_KEYS), false);
+  }
+  assert.deepEqual(extrasOf(undefined, MODEL_FORM_KEYS), {});
+});
+
+test("applying extras replaces them, so removing one there removes it from the file", () => {
+  const entry: Record<string, unknown> = { id: "m", cost: { input: 1 }, thinkingLevelMap: { high: "high" } };
+  applyExtras(entry, MODEL_FORM_KEYS, { compat: { supportsStrictTools: true } });
+  assert.deepEqual(entry, { id: "m", compat: { supportsStrictTools: true } });
+
+  // The JSON row can never overwrite a field that has its own row, while
+  // unknown keys still pass through.
+  const second: Record<string, unknown> = { id: "m" };
+  applyExtras(second, MODEL_FORM_KEYS, { id: "hijacked", reason: "x" });
+  assert.deepEqual(second, { id: "m", reason: "x" });
+});
+
+test("the JSON row rejects keys that have a row of their own", () => {
+  assert.deepEqual(parseExtras('{"cost":{"input":1}}', MODEL_FORM_KEYS), { cost: { input: 1 } });
+  assert.deepEqual(parseExtras("   ", MODEL_FORM_KEYS), {}, "empty means no extras");
+  assert.match((parseExtras('{"contextWindow":1}', MODEL_FORM_KEYS) as Error).message, /contextWindow/);
+  assert.ok(parseExtras("not json", MODEL_FORM_KEYS) instanceof Error);
+  assert.ok(parseExtras("[1]", MODEL_FORM_KEYS) instanceof Error);
+});
+
+test("a draft captures the extras so saving round-trips them", () => {
+  const draft = draftFromModel({ id: "m", cost: { input: 3 }, headers: { "X-Tier": "pro" } }, undefined, "m");
+  assert.deepEqual(draft.extras, { cost: { input: 3 }, headers: { "X-Tier": "pro" } });
+});
+
 test("turning image support off removes the input key so Pi's default applies", () => {
   const existing: ModelEntry = { id: "m", input: ["text", "image"] };
-  applyModelDraft(existing, { id: "m", image: false });
+  applyModelDraft(existing, { id: "m", image: false, extras: {} });
   assert.equal("input" in existing, false);
 });
 

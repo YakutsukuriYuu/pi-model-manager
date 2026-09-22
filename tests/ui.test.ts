@@ -602,6 +602,74 @@ test("providers logged in with /login are listed without any config", () => {
   assert.ok(h.manager.render(120).join("\n").includes("anthropic"));
 });
 
+test("edits fields that have no row of their own through the JSON row", async () => {
+  const doc: ModelsDocument = {
+    providers: {
+      demo: {
+        baseUrl: "https://a/v1",
+        api: "openai-completions",
+        models: [{ id: "m", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { high: "high" } }],
+      },
+    },
+  };
+  const h = harness(doc);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("e");
+  // Rows: id, name, contextWindow, maxTokens, reasoning, image, extras.
+  for (let i = 0; i < 6; i++) h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput('{"cost":{"input":9,"output":9,"cacheRead":0,"cacheWrite":0},"compat":{"supportsStrictTools":true}}');
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput(KEY.save);
+  await tick();
+
+  const model = h.saved.at(-1)?.providers?.demo.models?.[0];
+  assert.deepEqual(model?.cost, { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 });
+  assert.deepEqual(model?.compat, { supportsStrictTools: true });
+  // A key removed from the JSON row is removed from the file.
+  assert.equal("thinkingLevelMap" in (model ?? {}), false);
+});
+
+test("a model's untouched extras survive editing an ordinary field", async () => {
+  const doc: ModelsDocument = {
+    providers: {
+      demo: {
+        baseUrl: "https://a/v1",
+        api: "openai-completions",
+        models: [{ id: "m", contextWindow: 1000, cost: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { high: "high" } }],
+      },
+    },
+  };
+  const h = harness(doc);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("e");
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("2000");
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput(KEY.save);
+  await tick();
+
+  const model = h.saved.at(-1)?.providers?.demo.models?.[0];
+  assert.equal(model?.contextWindow, 2000);
+  assert.deepEqual(model?.cost, { input: 3, output: 4, cacheRead: 0, cacheWrite: 0 });
+  assert.deepEqual(model?.thinkingLevelMap, { high: "high" });
+});
+
+test("the JSON row refuses a key that has its own row", async () => {
+  const h = harness(PROVIDER_DOC);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput("e");
+  for (let i = 0; i < 6; i++) h.manager.handleInput(KEY.down);
+  h.manager.handleInput(KEY.enter);
+  h.manager.handleInput('{"contextWindow":1}');
+  h.manager.handleInput(KEY.enter);
+  await tick();
+
+  assert.match(h.manager.render(140).join("\n"), /contextWindow 有专门的输入行/);
+});
+
 test("escape closes the manager from the provider list", () => {
   const h = harness(PROVIDER_DOC);
   h.manager.handleInput(KEY.escape);

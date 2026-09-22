@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, type Component, type Focusable, type TUI, Key, matchesKey } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, type Component, type Focusable, type TUI, Key, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import {
   SUPPORTED_APIS,
   applyCatalogMetadata,
@@ -41,6 +41,7 @@ import {
   hintLines,
   safeTheme,
   table,
+  tailToWidth,
 } from "./frame.ts";
 
 /** Re-exported so the extension entry point can build the catalog index. */
@@ -143,6 +144,8 @@ export interface ProviderDraft {
   apiKey?: string;
   authHeader?: boolean;
   headers?: Record<string, string>;
+  /** Everything models.json supports that has no row of its own (`compat`, …). */
+  extras: Record<string, unknown>;
 }
 
 export interface ModelDraft {
@@ -152,6 +155,57 @@ export interface ModelDraft {
   maxTokens?: number;
   reasoning?: boolean;
   image?: boolean;
+  /** Everything models.json supports that has no row of its own. */
+  extras: Record<string, unknown>;
+}
+
+/**
+ * Keys the model form owns.
+ *
+ * Everything else in a model entry — `cost`, `thinkingLevelMap`, `compat`,
+ * `samplingParams`, `promptCache`, `headers`, `api`, `baseUrl` — is edited
+ * verbatim through the JSON row, so the plugin can reach every field Pi reads
+ * without a form row for each one.
+ */
+export const MODEL_FORM_KEYS: ReadonlySet<string> = new Set([
+  "id",
+  "name",
+  "reasoning",
+  "input",
+  "contextWindow",
+  "maxTokens",
+]);
+
+/** Keys the provider form owns; the rest go through its JSON row. */
+export const PROVIDER_FORM_KEYS: ReadonlySet<string> = new Set([
+  "name",
+  "baseUrl",
+  "apiKey",
+  "api",
+  "authHeader",
+  "headers",
+]);
+
+/** The fields a form does not own, as a plain object. */
+export function extrasOf(entry: Record<string, unknown> | undefined, owned: ReadonlySet<string>): Record<string, unknown> {
+  if (!entry) return {};
+  return Object.fromEntries(Object.entries(entry).filter(([key]) => !owned.has(key)));
+}
+
+/**
+ * Replaces the fields a form does not own.
+ *
+ * Replacement rather than merge: the JSON row is the only editor for these
+ * keys, so removing one there has to remove it from the file.
+ */
+export function applyExtras(entry: Record<string, unknown>, owned: ReadonlySet<string>, extras: Record<string, unknown>): void {
+  for (const key of Object.keys(entry)) {
+    if (!owned.has(key)) delete entry[key];
+  }
+  for (const [key, value] of Object.entries(extras)) {
+    if (owned.has(key)) continue;
+    entry[key] = value;
+  }
 }
 
 export interface SaveResult {
@@ -446,6 +500,7 @@ export function draftFromProvider(
     apiKey: typeof entry?.apiKey === "string" ? entry.apiKey : undefined,
     authHeader: entry?.authHeader === true,
     headers: isRecord(entry?.headers) ? (entry.headers as Record<string, string>) : undefined,
+    extras: extrasOf(entry, PROVIDER_FORM_KEYS),
   };
 }
 
@@ -467,7 +522,29 @@ export function draftFromModel(
     maxTokens: pickNumber(entry, "maxTokens") ?? fallback?.maxTokens,
     reasoning: pickBoolean(entry, "reasoning") ?? fallback?.reasoning,
     image: pickImage(entry) ?? fallback?.image,
+    extras: extrasOf(entry, MODEL_FORM_KEYS),
   };
+}
+
+/**
+ * Parses the JSON row.
+ *
+ * Keys the form already owns are rejected rather than silently ignored: two
+ * editors for one field would make the saved result depend on write order.
+ */
+export function parseExtras(text: string, owned: ReadonlySet<string>): Record<string, unknown> | Error {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return new Error('必须是 JSON 对象，例如 {"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0}}');
+  }
+  if (!isRecord(parsed)) return new Error("必须是 JSON 对象");
+  const clash = Object.keys(parsed).find((key) => owned.has(key));
+  if (clash) return new Error(`${clash} 有专门的输入行，不要写在这里`);
+  return parsed;
 }
 
 export function parseHeaders(text: string): Record<string, string> | undefined | Error {
@@ -659,7 +736,9 @@ export class ModelManager implements Component, Focusable {
       return;
     }
     if (!screen.isNew && screen.providerId !== screen.draft.id) removeProvider(doc, screen.providerId);
-    applyProviderDraft(ensureProvider(doc, screen.draft.id), screen.draft);
+    const target = ensureProvider(doc, screen.draft.id);
+    applyProviderDraft(target, screen.draft);
+    applyExtras(target, PROVIDER_FORM_KEYS, screen.draft.extras);
     if (await this.commit(doc, `已保存接入 ${screen.draft.id}`)) {
       this.screen = { kind: "models", providerId: screen.draft.id, index: 0 };
     }
@@ -680,6 +759,7 @@ export class ModelManager implements Component, Focusable {
       const overrides = ensureModelOverrides(provider);
       const body: Record<string, unknown> = { ...overrides[screen.draft.id] };
       applyModelDraft(body, screen.draft);
+      applyExtras(body, MODEL_FORM_KEYS, screen.draft.extras);
       delete body.id;
       if (!screen.isNew && screen.originalId !== screen.draft.id) delete overrides[screen.originalId];
       const cleared = Object.keys(body).length === 0;
@@ -697,6 +777,7 @@ export class ModelManager implements Component, Focusable {
 
     const existing = findModel(provider, screen.draft.id) ?? { id: screen.draft.id };
     applyModelDraft(existing, screen.draft);
+    applyExtras(existing, MODEL_FORM_KEYS, screen.draft.extras);
     if (!screen.isNew && screen.originalId !== screen.draft.id) removeModel(provider, screen.originalId);
     upsertModel(provider, existing);
     if (await this.commit(doc, `已保存模型 ${screen.draft.id}`)) {
@@ -1208,6 +1289,20 @@ export class ModelManager implements Component, Focusable {
             write({ headers: parsed });
           }),
       },
+      {
+        // compat, modelOverrides, oauth …: whatever Pi accepts that has no row.
+        label: "其它字段",
+        value: Object.keys(draft.extras).length > 0 ? JSON.stringify(draft.extras) : "(未设置)",
+        edit: () =>
+          this.textField("其它字段 JSON", Object.keys(draft.extras).length > 0 ? JSON.stringify(draft.extras) : "", false, (value) => {
+            const parsed = parseExtras(value, PROVIDER_FORM_KEYS);
+            if (parsed instanceof Error) {
+              this.refresh(parsed.message, "warning");
+              return;
+            }
+            write({ extras: parsed });
+          }),
+      },
     ];
   }
 
@@ -1251,6 +1346,21 @@ export class ModelManager implements Component, Focusable {
       },
       { label: "思考", value: draft.reasoning ? "开" : "关", cycle: () => write({ reasoning: !draft.reasoning }) },
       { label: "图片输入", value: draft.image ? "开" : "关", cycle: () => write({ image: !draft.image }) },
+      {
+        // cost, thinkingLevelMap, samplingParams, compat, promptCache, headers,
+        // and the per-model api/baseUrl overrides all live here.
+        label: "其它字段",
+        value: Object.keys(draft.extras).length > 0 ? JSON.stringify(draft.extras) : "(未设置)",
+        edit: () =>
+          this.textField("其它字段 JSON", Object.keys(draft.extras).length > 0 ? JSON.stringify(draft.extras) : "", false, (value) => {
+            const parsed = parseExtras(value, MODEL_FORM_KEYS);
+            if (parsed instanceof Error) {
+              this.refresh(parsed.message, "warning");
+              return;
+            }
+            write({ extras: parsed });
+          }),
+      },
     ];
   }
 
@@ -1284,12 +1394,15 @@ export class ModelManager implements Component, Focusable {
    * Hints are rendered separately and always. Replacing them with a status
    * message leaves the reader without any way to see what the keys do.
    */
-  private notice(): { text: string; tone: "dim" | "warning" | "error" } | undefined {
+  private notice(width: number): { text: string; tone: "dim" | "warning" | "error" } | undefined {
     if (this.editing) {
       const marker = this._focused ? CURSOR_MARKER : "";
       const shown = this.editing.secret ? "•".repeat(this.editing.buffer.length) : this.editing.buffer;
-      const rule = this.editing.fresh ? "（输入即替换，Backspace 逐字删）" : "";
-      return { text: `${this.editing.label}: ${shown}${marker}▌ ${rule}`, tone: "dim" };
+      const prefix = `${this.editing.label}: `;
+      const suffix = `${marker}▌ ${this.editing.fresh ? "（输入即替换，Backspace 逐字删）" : ""}`;
+      // Keep the tail: this is where an inline editor types.
+      const room = Math.max(6, width - 2 - visibleWidth(prefix) - visibleWidth(suffix));
+      return { text: `${prefix}${tailToWidth(shown, room)}${suffix}`, tone: "dim" };
     }
     if (this.pendingConfirm) return { text: this.pendingConfirm.prompt, tone: "warning" };
     return this.status ?? undefined;
@@ -1357,7 +1470,7 @@ export class ModelManager implements Component, Focusable {
         maxRows: this.maxListRows(),
       }),
       footer: this.footer(PROVIDER_ACTIONS, width),
-      notice: this.notice(),
+      notice: this.notice(width),
     });
   }
 
@@ -1393,7 +1506,7 @@ export class ModelManager implements Component, Focusable {
         maxRows: this.maxListRows(),
       }),
       footer,
-      notice: this.notice(),
+      notice: this.notice(width),
     });
   }
 
@@ -1440,7 +1553,7 @@ export class ModelManager implements Component, Focusable {
       meta: this.editing ? [] : (meta ?? ["留空并保存即删除该项；表单未列出的字段会原样保留"]),
       body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "", maxRows: this.maxListRows(), marker: this.markerFor(fields, selected) }),
       footer,
-      notice: this.notice(),
+      notice: this.notice(width),
     });
   }
 
@@ -1476,7 +1589,7 @@ export class ModelManager implements Component, Focusable {
         maxRows: this.maxListRows(),
       }),
       footer,
-      notice: this.notice(),
+      notice: this.notice(width),
     });
   }
 
