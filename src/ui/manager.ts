@@ -1,0 +1,925 @@
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { CURSOR_MARKER, type Component, type Focusable, type TUI, Key, matchesKey } from "@earendil-works/pi-tui";
+import { SUPPORTED_APIS, type DiscoveredModel, type ProviderApi } from "../discovery.ts";
+import {
+  type LoadedModels,
+  type ModelEntry,
+  type ModelsDocument,
+  type ProviderEntry,
+  ensureProvider,
+  findModel,
+  modelEntries,
+  modelsJsonPath,
+  providerEntries,
+  removeModel,
+  removeProvider,
+  upsertModel,
+} from "../models-json.ts";
+import { type Column, type ThemeLike, compactCount, frame, safeTheme, table } from "./frame.ts";
+
+/** A model as Pi currently resolves it, including built-in catalog entries. */
+export interface CatalogModel {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  image?: boolean;
+}
+
+export interface ModelRow extends CatalogModel {
+  /** Present in models.json, so editable and deletable. */
+  inConfig: boolean;
+  current: boolean;
+}
+
+export interface ProviderRow {
+  id: string;
+  name?: string;
+  api?: string;
+  modelCount: number;
+  inConfig: boolean;
+}
+
+export interface ProviderDraft {
+  id: string;
+  name?: string;
+  baseUrl: string;
+  api: ProviderApi;
+  apiKey?: string;
+  authHeader?: boolean;
+  headers?: Record<string, string>;
+}
+
+export interface ModelDraft {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  image?: boolean;
+}
+
+export interface SaveResult {
+  ok: boolean;
+  error?: string;
+}
+
+export interface ManagerHost {
+  /** Re-read models.json from disk. */
+  load(): LoadedModels;
+  /** Persist and verify through Pi, rolling back when Pi rejects the file. */
+  save(doc: ModelsDocument): Promise<SaveResult>;
+  /** Every provider id Pi knows about, built-ins included. */
+  catalogProviderIds(): string[];
+  catalogModels(providerId: string): CatalogModel[];
+  /** Configured values used to prefill a provider that has no config yet. */
+  providerDefaults(providerId: string): { name?: string; baseUrl?: string; api?: string };
+  fetchModels(providerId: string, baseUrl: string, api: ProviderApi): Promise<DiscoveredModel[]>;
+  currentModelId(providerId: string): string | undefined;
+  setModel(providerId: string, modelId: string): Promise<boolean>;
+  notify(message: string, tone: "info" | "warning" | "error"): void;
+  close(): void;
+}
+
+interface FormField {
+  label: string;
+  value: string;
+  edit?(): void;
+  cycle?(delta: number): void;
+}
+
+interface Editing {
+  label: string;
+  buffer: string;
+  secret: boolean;
+  commit(value: string): void;
+}
+
+type Screen =
+  | { kind: "providers"; index: number }
+  | { kind: "models"; providerId: string; index: number }
+  | { kind: "providerForm"; providerId: string; isNew: boolean; draft: ProviderDraft; field: number }
+  | { kind: "modelForm"; providerId: string; originalId: string; isNew: boolean; draft: ModelDraft; field: number }
+  | { kind: "fetch"; providerId: string; discovered: DiscoveredModel[]; checked: Set<string>; index: number };
+
+const PROVIDER_ACTIONS = "↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭";
+const MODEL_ACTIONS = "↑↓ 选择   Enter 使用   e 编辑接入   a 添加模型   f 获取模型   d 删除   Esc 返回";
+const FORM_ACTIONS = "↑↓ 选择字段   Enter 编辑   ←→ 切换   Ctrl+S 保存   Esc 取消";
+const FETCH_ACTIONS = "↑↓ 移动   Space 勾选   a 全选/全不选   Enter 保存   Esc 取消";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// --- pure helpers (covered by tests) --------------------------------------------
+
+export function buildProviderRows(
+  configProviders: Array<[string, ProviderEntry]>,
+  catalogIds: readonly string[],
+  catalogCounts: ReadonlyMap<string, number>,
+): ProviderRow[] {
+  const rows: ProviderRow[] = configProviders.map(([id, entry]) => ({
+    id,
+    name: typeof entry.name === "string" ? entry.name : undefined,
+    api: typeof entry.api === "string" ? entry.api : undefined,
+    modelCount: modelEntries(entry).length || (catalogCounts.get(id) ?? 0),
+    inConfig: true,
+  }));
+  const configured = new Set(rows.map((row) => row.id));
+  for (const id of catalogIds) {
+    if (configured.has(id)) continue;
+    rows.push({ id, modelCount: catalogCounts.get(id) ?? 0, inConfig: false });
+  }
+  return rows.sort((left, right) => {
+    if (left.inConfig !== right.inConfig) return left.inConfig ? -1 : 1;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+export function buildModelRows(
+  configModels: readonly ModelEntry[],
+  catalog: readonly CatalogModel[],
+  currentId: string | undefined,
+): ModelRow[] {
+  const known = new Map(catalog.map((model) => [model.id, model]));
+  const rows: ModelRow[] = configModels.map((entry) => {
+    const fallback = known.get(entry.id);
+    return {
+      id: entry.id,
+      name: typeof entry.name === "string" ? entry.name : fallback?.name,
+      contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : fallback?.contextWindow,
+      maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : fallback?.maxTokens,
+      reasoning: typeof entry.reasoning === "boolean" ? entry.reasoning : fallback?.reasoning,
+      image: Array.isArray(entry.input) ? entry.input.includes("image") : fallback?.image,
+      inConfig: true,
+      current: entry.id === currentId,
+    };
+  });
+  const configured = new Set(rows.map((row) => row.id));
+  for (const model of catalog) {
+    if (configured.has(model.id)) continue;
+    rows.push({ ...model, inConfig: false, current: model.id === currentId });
+  }
+  return rows;
+}
+
+export function validateProviderDraft(draft: ProviderDraft): string | undefined {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(draft.id)) return "接入 ID 只能包含字母、数字和 . _ -，且不能以符号开头";
+  const baseUrl = draft.baseUrl.trim();
+  if (baseUrl.length === 0) return "Base URL 不能为空";
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "Base URL 必须以 http:// 或 https:// 开头";
+  } catch {
+    return "Base URL 不是合法地址";
+  }
+  return undefined;
+}
+
+export function validateModelDraft(draft: ModelDraft): string | undefined {
+  if (draft.id.trim().length === 0) return "模型 ID 不能为空";
+  for (const value of [draft.contextWindow, draft.maxTokens]) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) return "上下文窗口和最大输出必须是正整数";
+  }
+  return undefined;
+}
+
+function setOrDelete(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value === undefined || value === "") delete target[key];
+  else target[key] = value;
+}
+
+/** Touches only the fields the form exposes, so other keys survive untouched. */
+export function applyProviderDraft(existing: ProviderEntry, draft: ProviderDraft): void {
+  setOrDelete(existing, "name", draft.name?.trim() || undefined);
+  setOrDelete(existing, "baseUrl", draft.baseUrl.trim() || undefined);
+  setOrDelete(existing, "api", draft.api);
+  setOrDelete(existing, "apiKey", draft.apiKey?.trim() || undefined);
+  setOrDelete(existing, "authHeader", draft.authHeader === true ? true : undefined);
+  setOrDelete(existing, "headers", draft.headers && Object.keys(draft.headers).length > 0 ? draft.headers : undefined);
+}
+
+export function applyModelDraft(existing: ModelEntry, draft: ModelDraft): void {
+  setOrDelete(existing, "name", draft.name?.trim() || undefined);
+  setOrDelete(existing, "reasoning", draft.reasoning === true ? true : undefined);
+  // Pi defaults to text-only, so "text" alone is expressed by removing the key.
+  setOrDelete(existing, "input", draft.image === true ? ["text", "image"] : undefined);
+  setOrDelete(existing, "contextWindow", draft.contextWindow);
+  setOrDelete(existing, "maxTokens", draft.maxTokens);
+}
+
+export function draftFromProvider(
+  id: string,
+  entry: ProviderEntry | undefined,
+  defaults: { name?: string; baseUrl?: string; api?: string },
+): ProviderDraft {
+  const api = typeof entry?.api === "string" ? entry.api : defaults.api;
+  return {
+    id,
+    name: typeof entry?.name === "string" ? entry.name : defaults.name,
+    baseUrl: typeof entry?.baseUrl === "string" ? entry.baseUrl : defaults.baseUrl ?? "",
+    api: (SUPPORTED_APIS as readonly string[]).includes(api ?? "") ? (api as ProviderApi) : "openai-completions",
+    apiKey: typeof entry?.apiKey === "string" ? entry.apiKey : undefined,
+    authHeader: entry?.authHeader === true,
+    headers: isRecord(entry?.headers) ? (entry.headers as Record<string, string>) : undefined,
+  };
+}
+
+export function draftFromModel(entry: ModelEntry | undefined, fallback: CatalogModel | undefined): ModelDraft {
+  return {
+    id: entry?.id ?? fallback?.id ?? "",
+    name: typeof entry?.name === "string" ? entry.name : undefined,
+    contextWindow: typeof entry?.contextWindow === "number" ? entry.contextWindow : fallback?.contextWindow,
+    maxTokens: typeof entry?.maxTokens === "number" ? entry.maxTokens : fallback?.maxTokens,
+    reasoning: typeof entry?.reasoning === "boolean" ? entry.reasoning : fallback?.reasoning,
+    image: Array.isArray(entry?.input) ? entry.input.includes("image") : fallback?.image,
+  };
+}
+
+export function parseHeaders(text: string): Record<string, string> | undefined | Error {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return new Error('请求头必须是 JSON 对象，例如 {"X-Token":"abc"}');
+  }
+  if (!isRecord(parsed)) return new Error("请求头必须是 JSON 对象");
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== "string") return new Error(`请求头 ${key} 的值必须是字符串`);
+    headers[key] = value;
+  }
+  return headers;
+}
+
+/** API keys may be literals, `$ENV` references, or `!command` values. */
+export function redactSecret(value: string): string {
+  if (value.startsWith("$") || value.startsWith("!")) return value;
+  if (value.length <= 8) return "•".repeat(Math.max(1, value.length));
+  return `${value.slice(0, 4)}…${value.slice(-3)}`;
+}
+
+export function describeCapabilities(model: { reasoning?: boolean; image?: boolean; inferredReasoning?: boolean; inferredImage?: boolean }): string {
+  const parts: string[] = [];
+  if (model.reasoning) parts.push(model.inferredReasoning ? "思考?" : "思考");
+  if (model.image) parts.push(model.inferredImage ? "图片?" : "图片");
+  return parts.join(" ") || "文本";
+}
+
+// --- component ------------------------------------------------------------------
+
+export class ModelManager implements Component, Focusable {
+  private screen: Screen = { kind: "providers", index: 0 };
+  private loaded: LoadedModels;
+  private readonly tui: TUI;
+  private readonly theme: ThemeLike;
+  private editing: Editing | null = null;
+  private status: { text: string; tone: "dim" | "warning" | "error" } | null = null;
+  private busy = false;
+  private cachedWidth: number | undefined;
+  private cachedLines: string[] | undefined;
+  private _focused = false;
+
+  private readonly host: ManagerHost;
+
+  constructor(tui: TUI, theme: Theme, loaded: LoadedModels, host: ManagerHost) {
+    this.tui = tui;
+    this.theme = safeTheme(theme);
+    this.loaded = loaded;
+    this.host = host;
+  }
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.invalidate();
+  }
+
+  // --- state helpers ------------------------------------------------------------
+
+  private refresh(message?: string, tone: "dim" | "warning" | "error" = "dim"): void {
+    if (message !== undefined) this.status = { text: message, tone };
+    this.invalidate();
+    this.tui.requestRender();
+  }
+
+  private providerRows(): ProviderRow[] {
+    const counts = new Map<string, number>();
+    for (const [id, entry] of providerEntries(this.loaded.doc)) counts.set(id, modelEntries(entry).length);
+    return buildProviderRows(providerEntries(this.loaded.doc), this.host.catalogProviderIds(), counts);
+  }
+
+  private providerEntry(id: string): ProviderEntry | undefined {
+    return providerEntries(this.loaded.doc).find(([key]) => key === id)?.[1];
+  }
+
+  private modelRows(providerId: string): ModelRow[] {
+    return buildModelRows(modelEntries(this.providerEntry(providerId)), this.host.catalogModels(providerId), this.host.currentModelId(providerId));
+  }
+
+  private providerDefaults(providerId: string): { name?: string; baseUrl?: string; api?: string } {
+    return this.host.providerDefaults(providerId);
+  }
+
+  private async commit(doc: ModelsDocument, success: string): Promise<boolean> {
+    this.busy = true;
+    this.refresh("保存中…");
+    const result = await this.host.save(doc);
+    this.busy = false;
+    if (!result.ok) {
+      this.refresh(`保存失败，已回滚：${result.error ?? "未知错误"}`, "error");
+      return false;
+    }
+    this.loaded = this.host.load();
+    this.refresh(success);
+    return true;
+  }
+
+  private async saveProviderDraft(screen: Extract<Screen, { kind: "providerForm" }>): Promise<void> {
+    const problem = validateProviderDraft(screen.draft);
+    if (problem) {
+      this.refresh(problem, "warning");
+      return;
+    }
+    const doc = structuredClone(this.loaded.doc);
+    if (screen.isNew && this.providerEntry(screen.draft.id)) {
+      this.refresh(`接入 ${screen.draft.id} 已存在`, "warning");
+      return;
+    }
+    if (!screen.isNew && screen.providerId !== screen.draft.id) removeProvider(doc, screen.providerId);
+    applyProviderDraft(ensureProvider(doc, screen.draft.id), screen.draft);
+    if (await this.commit(doc, `已保存接入 ${screen.draft.id}`)) {
+      this.screen = { kind: "models", providerId: screen.draft.id, index: 0 };
+    }
+  }
+
+  private async saveModelDraft(screen: Extract<Screen, { kind: "modelForm" }>): Promise<void> {
+    const problem = validateModelDraft(screen.draft);
+    if (problem) {
+      this.refresh(problem, "warning");
+      return;
+    }
+    const doc = structuredClone(this.loaded.doc);
+    const provider = ensureProvider(doc, screen.providerId);
+    const existing = findModel(provider, screen.draft.id) ?? { id: screen.draft.id };
+    applyModelDraft(existing, screen.draft);
+    if (!screen.isNew && screen.originalId !== screen.draft.id) removeModel(provider, screen.originalId);
+    upsertModel(provider, existing);
+    if (await this.commit(doc, `已保存模型 ${screen.draft.id}`)) {
+      this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
+    }
+  }
+
+  private async saveFetched(screen: Extract<Screen, { kind: "fetch" }>): Promise<void> {
+    const chosen = screen.discovered.filter((model) => screen.checked.has(model.id));
+    if (chosen.length === 0) {
+      this.refresh("没有勾选任何模型", "warning");
+      return;
+    }
+    const doc = structuredClone(this.loaded.doc);
+    const provider = ensureProvider(doc, screen.providerId);
+    for (const model of chosen) upsertModel(provider, toEntry(model));
+    if (await this.commit(doc, `已写入 ${chosen.length} 个模型`)) {
+      this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
+    }
+  }
+
+  private async runFetch(providerId: string, baseUrl: string, api: ProviderApi): Promise<void> {
+    this.busy = true;
+    this.refresh("正在从上游获取模型…");
+    try {
+      const discovered = await this.host.fetchModels(providerId, baseUrl, api);
+      const configured = new Set(modelEntries(this.providerEntry(providerId)).map((entry) => entry.id));
+      const checked = new Set(discovered.filter((model) => !configured.has(model.id)).map((model) => model.id));
+      this.screen = { kind: "fetch", providerId, discovered, checked, index: 0 };
+      this.refresh(
+        discovered.length === 0
+          ? "上游没有返回模型"
+          : `发现 ${discovered.length} 个，其中 ${checked.size} 个是新的${checked.size === 0 ? "" : "（已勾选）"}`,
+        discovered.length === 0 ? "warning" : "dim",
+      );
+    } catch (error) {
+      this.refresh(`获取失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async useModel(providerId: string, modelId: string): Promise<void> {
+    const ok = await this.host.setModel(providerId, modelId);
+    this.refresh(
+      ok ? `当前模型已切换到 ${providerId}/${modelId}` : `无法使用 ${providerId}/${modelId}：接入未配置认证`,
+      ok ? "dim" : "error",
+    );
+  }
+
+  // --- input --------------------------------------------------------------------
+
+  handleInput(data: string): void {
+    if (this.busy) return;
+    if (this.editing) {
+      this.handleEditingInput(data);
+      return;
+    }
+    switch (this.screen.kind) {
+      case "providers":
+        this.handleProviders(data);
+        return;
+      case "models":
+        this.handleModels(data);
+        return;
+      case "providerForm":
+        this.handleProviderForm(data);
+        return;
+      case "modelForm":
+        this.handleModelForm(data);
+        return;
+      case "fetch":
+        this.handleFetch(data);
+        return;
+    }
+  }
+
+  private handleEditingInput(data: string): void {
+    const editing = this.editing;
+    if (!editing) return;
+    if (matchesKey(data, Key.escape)) {
+      this.editing = null;
+      this.refresh("已取消编辑");
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      this.editing = null;
+      editing.commit(editing.buffer);
+      return;
+    }
+    if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
+      this.editing = { ...editing, buffer: editing.buffer.slice(0, -1) };
+      this.refresh();
+      return;
+    }
+    if (data.length > 0 && !data.includes("\x1b") && [...data].every((char) => char >= " ")) {
+      this.editing = { ...editing, buffer: editing.buffer + data };
+      this.refresh();
+    }
+  }
+
+  private move(index: number, delta: number, count: number): number {
+    if (count === 0) return 0;
+    return (index + delta + count) % count;
+  }
+
+  private handleProviders(data: string): void {
+    const screen = this.screen as Extract<Screen, { kind: "providers" }>;
+    const rows = this.providerRows();
+    if (matchesKey(data, Key.escape) || data === "q") {
+      this.host.close();
+      return;
+    }
+    if (matchesKey(data, Key.up)) {
+      this.screen = { ...screen, index: this.move(screen.index, -1, rows.length) };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      this.screen = { ...screen, index: this.move(screen.index, 1, rows.length) };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const row = rows[screen.index];
+      if (row) this.screen = { kind: "models", providerId: row.id, index: 0 };
+      this.refresh();
+      return;
+    }
+    if (data === "n") {
+      this.screen = { kind: "providerForm", providerId: "", isNew: true, draft: draftFromProvider("", undefined, {}), field: 0 };
+      this.refresh();
+      return;
+    }
+    if (data === "r") {
+      this.loaded = this.host.load();
+      this.refresh("已从磁盘重载 models.json");
+      return;
+    }
+    if (data === "d") {
+      const row = rows[screen.index];
+      if (!row) return;
+      if (!row.inConfig) {
+        this.refresh(`${row.id} 是 Pi 内置接入，没有可删除的配置`, "warning");
+        return;
+      }
+      const doc = structuredClone(this.loaded.doc);
+      removeProvider(doc, row.id);
+      void this.commit(doc, `已删除接入 ${row.id} 的配置`);
+    }
+  }
+
+  private handleModels(data: string): void {
+    const screen = this.screen as Extract<Screen, { kind: "models" }>;
+    const rows = this.modelRows(screen.providerId);
+    if (matchesKey(data, Key.escape)) {
+      this.screen = { kind: "providers", index: 0 };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.up)) {
+      this.screen = { ...screen, index: this.move(screen.index, -1, rows.length) };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      this.screen = { ...screen, index: this.move(screen.index, 1, rows.length) };
+      this.refresh();
+      return;
+    }
+    const row = rows[screen.index];
+    if (matchesKey(data, Key.enter)) {
+      if (row) void this.useModel(screen.providerId, row.id);
+      return;
+    }
+    if (data === "e") {
+      const entry = this.providerEntry(screen.providerId);
+      this.screen = {
+        kind: "providerForm",
+        providerId: screen.providerId,
+        isNew: false,
+        draft: draftFromProvider(screen.providerId, entry, this.providerDefaults(screen.providerId)),
+        field: 0,
+      };
+      this.refresh();
+      return;
+    }
+    if (data === "a") {
+      this.screen = {
+        kind: "modelForm",
+        providerId: screen.providerId,
+        originalId: "",
+        isNew: true,
+        draft: draftFromModel(undefined, undefined),
+        field: 0,
+      };
+      this.refresh();
+      return;
+    }
+    if (data === "f") {
+      const entry = this.providerEntry(screen.providerId);
+      const defaults = this.providerDefaults(screen.providerId);
+      const baseUrl = (typeof entry?.baseUrl === "string" && entry.baseUrl) || defaults.baseUrl || "";
+      const api = (typeof entry?.api === "string" && entry.api) || defaults.api || "openai-completions";
+      if (!baseUrl) {
+        this.refresh("该接入还没有 Base URL，先按 e 编辑接入", "warning");
+        return;
+      }
+      const known = (SUPPORTED_APIS as readonly string[]).includes(api) ? (api as ProviderApi) : "openai-completions";
+      void this.runFetch(screen.providerId, baseUrl, known);
+      return;
+    }
+    if (data === "d") {
+      if (!row) return;
+      if (!row.inConfig) {
+        this.refresh(`${row.id} 来自 Pi 内置目录，没有可删除的配置`, "warning");
+        return;
+      }
+      const doc = structuredClone(this.loaded.doc);
+      removeModel(ensureProvider(doc, screen.providerId), row.id);
+      void this.commit(doc, `已删除模型 ${row.id}`);
+    }
+  }
+
+  /**
+   * Shared key handling for both forms. The narrowed screen is passed in as a
+   * local so the union stays narrowed inside the callbacks.
+   */
+  private handleFormKeys(
+    data: string,
+    field: number,
+    fields: FormField[],
+    actions: {
+      setField(field: number): void;
+      back(): void;
+      save(): void;
+    },
+  ): void {
+    if (matchesKey(data, Key.escape)) {
+      actions.back();
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("s"))) {
+      actions.save();
+      return;
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+      actions.setField(this.move(field, matchesKey(data, Key.up) ? -1 : 1, fields.length));
+      this.refresh();
+      return;
+    }
+    const current = fields[field];
+    if (!current) return;
+    if (matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
+      current.cycle?.(matchesKey(data, Key.left) ? -1 : 1);
+      return;
+    }
+    if (matchesKey(data, Key.enter)) current.edit?.();
+  }
+
+  private handleProviderForm(data: string): void {
+    if (this.screen.kind !== "providerForm") return;
+    const screen = this.screen;
+    this.handleFormKeys(data, screen.field, this.providerFields(screen), {
+      setField: (field) => {
+        this.screen = { ...screen, field };
+      },
+      back: () => {
+        this.screen = screen.isNew ? { kind: "providers", index: 0 } : { kind: "models", providerId: screen.providerId, index: 0 };
+      },
+      save: () => void this.saveProviderDraft(screen),
+    });
+  }
+
+  private handleModelForm(data: string): void {
+    if (this.screen.kind !== "modelForm") return;
+    const screen = this.screen;
+    this.handleFormKeys(data, screen.field, this.modelFields(screen), {
+      setField: (field) => {
+        this.screen = { ...screen, field };
+      },
+      back: () => {
+        this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
+      },
+      save: () => void this.saveModelDraft(screen),
+    });
+  }
+
+  private handleFetch(data: string): void {
+    const screen = this.screen as Extract<Screen, { kind: "fetch" }>;
+    if (matchesKey(data, Key.escape)) {
+      this.screen = { kind: "models", providerId: screen.providerId, index: 0 };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+      const delta = matchesKey(data, Key.up) ? -1 : 1;
+      this.screen = { ...screen, index: this.move(screen.index, delta, screen.discovered.length) };
+      this.refresh();
+      return;
+    }
+    const model = screen.discovered[screen.index];
+    if (matchesKey(data, Key.space)) {
+      if (!model) return;
+      const checked = new Set(screen.checked);
+      if (checked.has(model.id)) checked.delete(model.id);
+      else checked.add(model.id);
+      this.screen = { ...screen, checked };
+      this.refresh();
+      return;
+    }
+    if (data === "a") {
+      const allChecked = screen.checked.size === screen.discovered.length && screen.discovered.length > 0;
+      this.screen = { ...screen, checked: allChecked ? new Set() : new Set(screen.discovered.map((entry) => entry.id)) };
+      this.refresh();
+      return;
+    }
+    if (matchesKey(data, Key.enter)) void this.saveFetched(screen);
+  }
+
+  // --- field definitions --------------------------------------------------------
+
+  private textField(label: string, current: string, secret: boolean, commit: (value: string) => void): void {
+    this.editing = { label, buffer: secret ? "" : current, secret, commit };
+    this.refresh();
+  }
+
+  private providerFields(screen: Extract<Screen, { kind: "providerForm" }>): FormField[] {
+    const draft = screen.draft;
+    const write = (patch: Partial<ProviderDraft>) => {
+      this.screen = { ...screen, draft: { ...draft, ...patch } };
+      this.refresh();
+    };
+    return [
+      {
+        label: "接入 ID",
+        value: draft.id || "(必填)",
+        edit: screen.isNew ? () => this.textField("接入 ID", draft.id, false, (value) => write({ id: value.trim() })) : undefined,
+      },
+      { label: "名称", value: draft.name || "(未设置)", edit: () => this.textField("名称", draft.name ?? "", false, (value) => write({ name: value })) },
+      {
+        label: "协议",
+        value: draft.api,
+        cycle: (delta) => {
+          const list = SUPPORTED_APIS as readonly ProviderApi[];
+          write({ api: list[this.move(list.indexOf(draft.api), delta, list.length)] });
+        },
+      },
+      { label: "Base URL", value: draft.baseUrl || "(必填)", edit: () => this.textField("Base URL", draft.baseUrl, false, (value) => write({ baseUrl: value.trim() })) },
+      {
+        label: "API Key",
+        value: draft.apiKey ? redactSecret(draft.apiKey) : "(未设置，可填 $ENV 或 !command)",
+        edit: () => this.textField("API Key", draft.apiKey ?? "", true, (value) => write({ apiKey: value.trim() })),
+      },
+      { label: "authHeader", value: draft.authHeader ? "开" : "关", cycle: () => write({ authHeader: !draft.authHeader }) },
+      {
+        label: "请求头",
+        value: draft.headers && Object.keys(draft.headers).length > 0 ? JSON.stringify(draft.headers) : "(未设置)",
+        edit: () =>
+          this.textField("请求头 JSON", draft.headers ? JSON.stringify(draft.headers) : "", false, (value) => {
+            const parsed = parseHeaders(value);
+            if (parsed instanceof Error) {
+              this.refresh(parsed.message, "warning");
+              return;
+            }
+            write({ headers: parsed });
+          }),
+      },
+    ];
+  }
+
+  private modelFields(screen: Extract<Screen, { kind: "modelForm" }>): FormField[] {
+    const draft = screen.draft;
+    const write = (patch: Partial<ModelDraft>) => {
+      this.screen = { ...screen, draft: { ...draft, ...patch } };
+      this.refresh();
+    };
+    const numberField = (label: string, current: number | undefined, commit: (value: number | undefined) => void) => {
+      this.textField(label, current === undefined ? "" : String(current), false, (value) => {
+        const trimmed = value.trim();
+        if (trimmed.length === 0) {
+          commit(undefined);
+          return;
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          this.refresh(`${label} 必须是正整数`, "warning");
+          return;
+        }
+        commit(parsed);
+      });
+    };
+    return [
+      {
+        label: "模型 ID",
+        value: draft.id || "(必填)",
+        edit: screen.isNew ? () => this.textField("模型 ID", draft.id, false, (value) => write({ id: value.trim() })) : undefined,
+      },
+      { label: "显示名称", value: draft.name || "(未设置)", edit: () => this.textField("显示名称", draft.name ?? "", false, (value) => write({ name: value })) },
+      {
+        label: "上下文窗口",
+        value: draft.contextWindow === undefined ? "(未设置)" : String(draft.contextWindow),
+        edit: () => numberField("上下文窗口", draft.contextWindow, (value) => write({ contextWindow: value })),
+      },
+      {
+        label: "最大输出",
+        value: draft.maxTokens === undefined ? "(未设置)" : String(draft.maxTokens),
+        edit: () => numberField("最大输出", draft.maxTokens, (value) => write({ maxTokens: value })),
+      },
+      { label: "思考", value: draft.reasoning ? "开" : "关", cycle: () => write({ reasoning: !draft.reasoning }) },
+      { label: "图片输入", value: draft.image ? "开" : "关", cycle: () => write({ image: !draft.image }) },
+    ];
+  }
+
+  // --- rendering ----------------------------------------------------------------
+
+  render(width: number): string[] {
+    if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+    this.cachedWidth = width;
+    this.cachedLines =
+      this.screen.kind === "providers"
+        ? this.renderProviders(width)
+        : this.screen.kind === "models"
+          ? this.renderModels(width, this.screen.providerId)
+          : this.screen.kind === "providerForm"
+            ? this.renderProviderForm(width)
+            : this.screen.kind === "modelForm"
+              ? this.renderModelForm(width)
+              : this.renderFetch(width);
+    return this.cachedLines;
+  }
+
+  private footer(actions: string): { text: string; tone: "dim" | "warning" | "error" } {
+    if (this.editing) {
+      const marker = this._focused ? CURSOR_MARKER : "";
+      const shown = this.editing.secret ? "•".repeat(this.editing.buffer.length) : this.editing.buffer;
+      return { text: `${this.editing.label}: ${shown}${marker}▌   Enter 确认   Esc 取消`, tone: "dim" };
+    }
+    if (this.status) return { text: this.status.text, tone: this.status.tone };
+    return { text: actions, tone: "dim" };
+  }
+
+  private renderProviders(width: number): string[] {
+    const rows = this.providerRows();
+    const screen = this.screen as Extract<Screen, { kind: "providers" }>;
+    const configured = rows.filter((row) => row.inConfig).length;
+    const columns: Column<ProviderRow>[] = [
+      { title: "接入", width: "flex", value: (row) => row.id },
+      { title: "协议", width: 22, value: (row) => row.api ?? (row.inConfig ? "继承内置" : "内置") },
+      { title: "来源", width: 6, value: (row) => (row.inConfig ? "配置" : "内置") },
+      { title: "模型", width: 5, right: true, value: (row) => String(row.modelCount) },
+    ];
+    return frame({
+      theme: this.theme,
+      width,
+      title: `Pi 模型配置 · ${configured} 个接入配置 · ${rows.reduce((total, row) => total + row.modelCount, 0)} 个模型`,
+      meta: [modelsJsonPath()],
+      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "没有任何接入。按 n 新建，填 Base URL 和 API Key 即可自动获取模型。" }),
+      footer: this.footer(PROVIDER_ACTIONS).text,
+      footerTone: this.footer(PROVIDER_ACTIONS).tone,
+    });
+  }
+
+  private renderModels(width: number, providerId: string): string[] {
+    const screen = this.screen as Extract<Screen, { kind: "models" }>;
+    const entry = this.providerEntry(providerId);
+    const rows = this.modelRows(providerId);
+    const defaults = this.providerDefaults(providerId);
+    const baseUrl = (typeof entry?.baseUrl === "string" && entry.baseUrl) || defaults.baseUrl;
+    const apiKey = typeof entry?.apiKey === "string" ? redactSecret(entry.apiKey) : "(未设置)";
+    const columns: Column<ModelRow>[] = [
+      { title: "模型", width: "flex", value: (row) => `${row.current ? "★ " : ""}${row.id}` },
+      { title: "上下文", width: 7, right: true, value: (row) => compactCount(row.contextWindow) },
+      { title: "输出", width: 7, right: true, value: (row) => compactCount(row.maxTokens) },
+      { title: "能力", width: 12, value: (row) => describeCapabilities(row) },
+      { title: "来源", width: 6, value: (row) => (row.inConfig ? "配置" : "内置") },
+    ];
+    const footer = this.footer(MODEL_ACTIONS);
+    return frame({
+      theme: this.theme,
+      width,
+      title: `接入 ${providerId}${entry ? "" : "（内置，尚无配置）"}`,
+      meta: [`${baseUrl ?? "(未设置 Base URL)"} · API Key ${apiKey}`, `模型 ${rows.length} 个（配置 ${rows.filter((row) => row.inConfig).length} 个，内置 ${rows.filter((row) => !row.inConfig).length} 个）`],
+      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "该接入还没有模型。按 f 从上游获取，或按 a 手动添加。" }),
+      footer: footer.text,
+      footerTone: footer.tone,
+    });
+  }
+
+  private renderProviderForm(width: number): string[] {
+    const screen = this.screen as Extract<Screen, { kind: "providerForm" }>;
+    return this.renderForm(width, `接入${screen.isNew ? "" : ` ${screen.providerId}`}`, this.providerFields(screen), screen.field, screen.isNew);
+  }
+
+  private renderModelForm(width: number): string[] {
+    const screen = this.screen as Extract<Screen, { kind: "modelForm" }>;
+    return this.renderForm(width, `模型${screen.isNew ? "" : ` ${screen.originalId}`}`, this.modelFields(screen), screen.field, screen.isNew);
+  }
+
+  private renderForm(width: number, what: string, fields: FormField[], selected: number, isNew: boolean): string[] {
+    const columns: Column<FormField>[] = [
+      { title: "字段", width: 13, value: (row) => row.label },
+      { title: "", width: "flex", value: (row) => row.value },
+    ];
+    const footer = this.footer(FORM_ACTIONS);
+    return frame({
+      theme: this.theme,
+      width,
+      title: `${isNew ? "新建" : "编辑"}${what}`,
+      meta: this.editing ? [] : ["留空并保存即删除该项；表单未列出的字段会原样保留"],
+      body: table({ theme: this.theme, width, columns, rows: fields, selected, empty: "" }),
+      footer: footer.text,
+      footerTone: footer.tone,
+    });
+  }
+
+  private renderFetch(width: number): string[] {
+    const screen = this.screen as Extract<Screen, { kind: "fetch" }>;
+    const rows = screen.discovered;
+    const columns: Column<DiscoveredModel>[] = [
+      { title: "", width: 3, value: (row) => (screen.checked.has(row.id) ? "[x]" : "[ ]") },
+      { title: "模型", width: "flex", value: (row) => row.id },
+      { title: "上下文", width: 7, right: true, value: (row) => compactCount(row.contextWindow) },
+      { title: "输出", width: 7, right: true, value: (row) => compactCount(row.maxTokens) },
+      { title: "识别到", width: 12, value: (row) => describeCapabilities(row) },
+    ];
+    const footer = this.footer(FETCH_ACTIONS);
+    return frame({
+      theme: this.theme,
+      width,
+      title: `从上游获取模型 · ${screen.providerId}`,
+      meta: [`已勾选 ${screen.checked.size} / ${rows.length}`, "已有模型不会被改写，只新增勾选项"],
+      body: table({ theme: this.theme, width, columns, rows, selected: Math.min(screen.index, Math.max(0, rows.length - 1)), empty: "上游没有返回任何模型" }),
+      footer: footer.text,
+      footerTone: footer.tone,
+    });
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedLines = undefined;
+  }
+}
+
+function toEntry(model: DiscoveredModel): ModelEntry {
+  const entry: ModelEntry = { id: model.id };
+  if (model.name) entry.name = model.name;
+  if (model.reasoning) entry.reasoning = true;
+  if (model.image) entry.input = ["text", "image"];
+  if (model.contextWindow !== undefined) entry.contextWindow = model.contextWindow;
+  if (model.maxTokens !== undefined) entry.maxTokens = model.maxTokens;
+  return entry;
+}

@@ -1,73 +1,115 @@
 # pi-model-manager
 
-统一查看、发现和切换 Pi 中的模型。当前版本提供只读模型目录，并开始支持由本插件创建的标准 Provider。已有 Provider 不会被覆盖。
+直接管理 Pi 自己的模型配置 `~/.pi/agent/models.json` 的 TUI 插件。
+
+你只需要提供 **Base URL** 和 **API Key**，插件负责把上游的模型列表拉取出来写进配置。
 
 ## 安装
-
-通过 Pi 安装 GitHub 仓库：
 
 ```bash
 pi install git:github.com/YakutsukuriYuu/pi-model-manager
 ```
 
-本地测试：
+试用（不写入设置）：
 
 ```bash
-pi -e ./index.ts
+pi -e git:github.com/YakutsukuriYuu/pi-model-manager
 ```
 
 ## 使用
 
-安装或通过本地路径加载后，在 Pi 中执行：
-
 ```text
 /models
 ```
 
-添加一个由本插件管理的 Provider：
+### 接入列表
 
 ```text
-/models add
+↑↓ 选择   Enter 进入   n 新建   r 重载   d 删除   Esc 关闭
 ```
 
-添加完成后执行：
+列表里既有 `models.json` 里的接入（来源显示「配置」，可编辑可删除），也有 Pi 内置接入（来源显示「内置」，可以进入查看、给它们写配置覆盖）。
+
+### 新建接入
+
+按 `n`，依次填写：
 
 ```text
-/login pi-auto-<name>
-/models
+接入 ID  →  名称（可空）  →  协议（←→ 切换）  →  Base URL  →  API Key
 ```
 
-插件会通过标准 `/models` 接口发现模型。快捷键：
+按 `Ctrl+S` 保存，回到该接入后按 `f` 从上游获取模型：
 
-- `↑/↓`：移动
-- `Enter`：选择当前模型
-- `/`：搜索
-- `Tab` / `f`：切换 Provider 筛选
-- `a`：添加 Provider
-- `r`：刷新模型目录
-- `Esc` / `q`：关闭
+```text
+发现 12 个，其中 3 个是新的（已勾选）
+```
 
-## 刷新行为
+勾选后按 `Enter` 写入配置。**已有的模型不会被改写，只新增勾选项。**
 
-- 启动时是缓存优先：Pi 用上次持久化的目录，不发网络请求。
-- 按 `r` 时才请求上游 `/models`，成功后发现并持久化。
-- 刷新失败只报错，不会清空已有模型。
-- 未执行 `/login` 前静默跳过，不报错。
-- `--offline` 下不发任何请求。
+### 模型列表
+
+```text
+↑↓ 选择   Enter 使用   e 编辑接入   a 添加模型   f 获取模型   d 删除   Esc 返回
+```
+
+- `Enter` 把该模型设为当前会话模型
+- `e` 编辑接入（Base URL、API Key、协议、authHeader、请求头）
+- `a` 手动添加一个模型
+- `f` 重新从上游获取，补齐缺失的模型
+- `d` 删除模型配置
+
+## API Key 的写法
+
+`API Key` 怎么写就怎么存，Pi 原生支持三种形式：
+
+```text
+sk-abc123...       字面值（明文存在 models.json 里）
+$MY_API_KEY        环境变量引用
+!op read 'op://…'  执行命令取值
+```
+
+插件会按 Pi 的规则解析它们（包括 `/login` 保存的凭据），不需要额外配置。
+
+明文写入时注意 `models.json` 里有密钥，建议改用环境变量或命令形式。
+
+## 写入安全
+
+`models.json` 属于 Pi，不是插件私有文件，所以写入做了这些保护：
+
+- **校验后回滚**：写完后让 Pi 重新加载，如果 Pi 判定 schema 不合法就立刻还原原文件。Pi 是整文件校验的，一个条目不合法会导致**所有** Provider 失效，所以这一步必须有。
+- **自动备份**：每次写入前把原内容存到 `models.json.bak`。
+- **保留未知键**：只修改表单里列出的字段，其它键原样保留（例如其它工具写入的 `piModelManager` 标记）。
+- **权限 0600**，原子写入。
+- **注释提醒**：Pi 允许 `models.json` 带注释（JSONC），但重写会丢失注释，因此读取时会检测并在有注释时提示。
+
+## 发现规则
+
+按各 SDK 的真实行为推导模型列表地址：
+
+| 协议 | 模型列表地址 |
+| --- | --- |
+| `anthropic-messages` | `${baseUrl}/v1/models`（SDK 自己会补 `/v1`，网关路径同样处理） |
+| `openai-completions` | `${baseUrl}/models` |
+| `openai-responses` | `${baseUrl}/models` |
+| `google-generative-ai` | `${baseUrl}/models`（baseUrl 通常已含 `/v1beta`） |
+
+认证头按协议选择：`Authorization: Bearer`、`x-api-key` + `anthropic-version`、`x-goog-api-key`。
+
+能识别 OpenAI、Anthropic、Google 以及 OpenRouter 风格的返回格式，并且**只写上游真正报告过的字段**，不猜数字。上游只给 ID 时，条目光秃秃地只有 `id`，其余交给 Pi 的默认值，之后你可以在表单里改。
+
+能力（思考 / 图片）如果是从模型 ID 推断出来的，列表里会标成 `思考?` / `图片?`，表示这是猜测而非上游声明。
 
 ## 开发
 
 ```bash
 npm install
-npm run check   # typecheck + 单元测试
+npm run check    # 类型检查 + 单元测试
 ```
 
-测试覆盖发现接口的三种返回格式、各协议的请求头与 URL 规则，以及刷新/离线/失败/中止时的行为。
+测试覆盖：`models.json` 读写与回滚、未知键保留、JSONC 读取、注释检测、发现接口的四种返回格式、各协议 URL 与请求头、以及表单草稿的字段增删语义。
 
-## 当前边界
+## 已知边界
 
-- 内置 Provider 和其他扩展注册的模型显示为只读。
-- `/models add` 支持 `openai-completions`、`openai-responses`、`anthropic-messages` 和 `google-generative-ai`。
-- Provider 元数据保存到 `~/.pi/agent/pi-model-manager.json`；API Key 交给 Pi 的 `/login` 和 auth 存储处理。
-- 当前版本还没有模型字段编辑、Provider 删除和自定义 Header 编辑界面。
-- 运行时无法可靠暴露模型最初来自哪个配置文件，因此外部 Provider 标记为 `Registry`。
+- 不修改 Pi 内置目录的模型，只能通过写配置来覆盖（与 Pi 的 `models.json` 语义一致）。
+- 没有批量操作，也没有模型健康检查。
+- 上游没有模型列表接口时只能手动添加模型。
